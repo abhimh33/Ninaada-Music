@@ -1,0 +1,3937 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { View, Text, TextInput, FlatList, TouchableOpacity, Image, ScrollView, StyleSheet, ActivityIndicator, Modal, Alert, BackHandler, Dimensions, Pressable, Share, AppState, PanResponder, Animated, Linking, ToastAndroid, StatusBar, Platform } from 'react-native';
+import { MaterialIcons, FontAwesome, Ionicons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Audio } from 'expo-av';
+import * as Notifications from 'expo-notifications';
+import { File, Directory, Paths } from 'expo-file-system';
+import { LinearGradient } from 'expo-linear-gradient';
+
+// ========== API Configuration ==========
+// For local development, use your local IP:
+// const API_BASE = "http://10.20.3.243:8000";
+// For Render deployment, replace with your Render service URL:
+const API_BASE = "http://10.20.3.243:8000";
+// Example: const API_BASE = "https://jiosaavn-api-xxxx.onrender.com";
+
+// ✅ Helper: Deduplicate songs by ID
+const dedupeSongs = (songs) => {
+  const seen = new Set();
+  return songs.filter(song => {
+    if (!song || !song.id) return false;
+    if (seen.has(song.id)) return false;
+    seen.add(song.id);
+    return true;
+  });
+};
+
+// ✅ Helper: Add unique instance ID to song if not present (handles duplicates in queue)
+let songInstanceCounter = 0;
+const ensureUniqueId = (song) => {
+  if (!song._uniqueId) {
+    song._uniqueId = `${song.id}-${++songInstanceCounter}`;
+  }
+  return song;
+};
+
+// ✅ Download Handler (uses new expo-file-system File/Directory API)
+const handleDownload = async (song, setDownloadProgress, onDownloadComplete) => {
+  try {
+    if (!song?.media_url) {
+      Alert.alert('Download error', 'No media URL available for this song.');
+      return;
+    }
+    const safeName = (song.name || 'song').replace(/[^a-z0-9.\-_]/gi, '_');
+    // Create download directory inside app's document storage
+    const downloadDir = new Directory(Paths.document, 'NinaadaDownloads');
+    if (!downloadDir.exists) {
+      downloadDir.create();
+    }
+    console.log('Downloading to:', downloadDir.uri + '/' + safeName + '.mp3');
+    if (setDownloadProgress) setDownloadProgress({ song: song.name, percent: 0 });
+    // Use the new File.downloadFileAsync API
+    const downloadedFile = await File.downloadFileAsync(
+      song.media_url,
+      new File(downloadDir, `${safeName}.mp3`)
+    );
+    if (downloadedFile && downloadedFile.exists) {
+      // Save downloaded song metadata to AsyncStorage for offline playback
+      try {
+        const stored = await AsyncStorage.getItem('downloadedSongs');
+        const downloadedSongs = stored ? JSON.parse(stored) : [];
+        // Remove existing entry for same song
+        const updated = downloadedSongs.filter(s => s.id !== song.id);
+        updated.push({
+          ...song,
+          localUri: downloadedFile.uri,
+          downloadedAt: new Date().toISOString(),
+        });
+        await AsyncStorage.setItem('downloadedSongs', JSON.stringify(updated));
+      } catch (e) {
+        console.log('Error saving download metadata:', e);
+      }
+      if (setDownloadProgress) setDownloadProgress(null);
+      if (onDownloadComplete) onDownloadComplete();
+      Alert.alert('✅ Download complete', `${song.name} saved for offline playback!`);
+    } else {
+      if (setDownloadProgress) setDownloadProgress(null);
+      Alert.alert('❌ Download failed', 'File was not saved properly.');
+    }
+  } catch (err) {
+    console.error('Download failed:', err);
+    if (setDownloadProgress) setDownloadProgress(null);
+    Alert.alert('❌ Download failed', 'Could not download the song: ' + err.message);
+  }
+};
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState('home');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [songs, setSongs] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [currentSong, setCurrentSong] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [queue, setQueue] = useState([]);
+  const [likedSongs, setLikedSongs] = useState([]);
+  const [playlists, setPlaylists] = useState([]);
+  const [newPlaylistName, setNewPlaylistName] = useState('');
+  const [selectedPlaylist, setSelectedPlaylist] = useState(null);
+  const [showQueue, setShowQueue] = useState(false);
+  const [showPlaylistDetail, setShowPlaylistDetail] = useState(false);
+  const [shuffle, setShuffle] = useState(false);
+  const [repeat, setRepeat] = useState('off');
+  const [lyrics, setLyrics] = useState('');
+  const [showLyrics, setShowLyrics] = useState(false);
+  const [navigationStack, setNavigationStack] = useState(['home']);
+  const [progress, setProgress] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [songDuration, setSongDuration] = useState('0:00');
+  const [currentTime, setCurrentTime] = useState('0:00');
+  const [showSongMenu, setShowSongMenu] = useState(false);
+  const [selectedMenuSong, setSelectedMenuSong] = useState(null);
+  const [playbackIntervalId, setPlaybackIntervalId] = useState(null);
+  const [sound, setSound] = useState(null);
+  const [showPlaylistSelector, setShowPlaylistSelector] = useState(false);
+  const [queueContext, setQueueContext] = useState(null); // 'liked' or 'playlist-{id}'
+  const [showThreeDotMenu, setShowThreeDotMenu] = useState(false);
+  const [selectedThreeDotSong, setSelectedThreeDotSong] = useState(null);
+  const [recentlyPlayed, setRecentlyPlayed] = useState([]);
+  const [isDraggingSeek, setIsDraggingSeek] = useState(false);
+  const [seekingPosition, setSeekingPosition] = useState(0);
+  const [showMiniPlayer, setShowMiniPlayer] = useState(false);
+  const [autoPlaySimilar, setAutoPlaySimilar] = useState(false); // Auto-play toggle (default OFF)
+  const [draggedQueueItem, setDraggedQueueItem] = useState(null);
+  const [editingPlaylistId, setEditingPlaylistId] = useState(null);
+  const [editingPlaylistName, setEditingPlaylistName] = useState('');
+  const [lyricsLines, setLyricsLines] = useState([]); // Formatted lyric lines
+  const [currentLyricIndex, setCurrentLyricIndex] = useState(-1); // Current line being played
+  const [downloadedSongs, setDownloadedSongs] = useState([]); // Offline songs
+  const [downloadProgress, setDownloadProgress] = useState(null); // { song, percent }
+  // Library sub-tab: 'playlists' or 'downloads'
+  const [libraryTab, setLibraryTab] = useState('playlists');
+  // Sleep Timer
+  const [sleepTimerActive, setSleepTimerActive] = useState(false);
+  const [sleepTimerMinutes, setSleepTimerMinutes] = useState(0);
+  const [sleepTimerRemaining, setSleepTimerRemaining] = useState(0); // seconds left
+  const [showSleepTimerModal, setShowSleepTimerModal] = useState(false);
+  const [sleepTimerEndOfSong, setSleepTimerEndOfSong] = useState(false);
+  const sleepTimerRef = useRef(null);
+  // Play Count & Most Played
+  const [playCounts, setPlayCounts] = useState({}); // { songId: { count, song } }
+  // Playback Speed
+  const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
+  const [showSpeedModal, setShowSpeedModal] = useState(false);
+  // Quick Picks / Suggestions
+  const [quickPicks, setQuickPicks] = useState([]);
+  const [loadingQuickPicks, setLoadingQuickPicks] = useState(false);
+  const appState = useRef(AppState.currentState);
+
+  // ✅ Refs to prevent stale closures in audio callbacks
+  const currentSongRef = useRef(null);
+  const queueRef = useRef([]);
+  const repeatRef = useRef('off');
+  const shuffleRef = useRef(false);
+  const autoPlaySimilarRef = useRef(false);
+  const queueContextRef = useRef(null);
+  const likedSongsRef = useRef([]);
+  const playlistsRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const playbackLockRef = useRef(false); // Prevents simultaneous playback
+
+  // ✅ Keep refs in sync with state (prevents stale closures in audio callbacks)
+  useEffect(() => { currentSongRef.current = currentSong; }, [currentSong]);
+  useEffect(() => { queueRef.current = queue; }, [queue]);
+  useEffect(() => { repeatRef.current = repeat; }, [repeat]);
+  useEffect(() => { shuffleRef.current = shuffle; }, [shuffle]);
+  useEffect(() => { autoPlaySimilarRef.current = autoPlaySimilar; }, [autoPlaySimilar]);
+  useEffect(() => { queueContextRef.current = queueContext; }, [queueContext]);
+  useEffect(() => { likedSongsRef.current = likedSongs; }, [likedSongs]);
+  useEffect(() => { playlistsRef.current = playlists; }, [playlists]);
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+
+  // Load liked songs, playlists, and downloaded songs on app start
+  useEffect(() => {
+    loadLikedSongs();
+    loadPlaylists();
+    loadRecentlyPlayed();
+    loadDownloadedSongs();
+    loadPlayCounts();
+    initializeAudio();
+    setupNotifications();
+  }, []);
+
+  // Load downloaded songs from AsyncStorage
+  const loadDownloadedSongs = async () => {
+    try {
+      const data = await AsyncStorage.getItem('downloadedSongs');
+      if (data) setDownloadedSongs(JSON.parse(data));
+    } catch (e) {
+      console.log('Error loading downloaded songs:', e);
+    }
+  };
+
+  // Delete a downloaded song
+  const deleteDownloadedSong = async (songId) => {
+    try {
+      const song = downloadedSongs.find(s => s.id === songId);
+      // Try to delete the file
+      if (song?.localUri) {
+        try {
+          const file = new File(song.localUri);
+          if (file.exists) file.delete();
+        } catch (e) { console.log('Error deleting file:', e); }
+      }
+      const updated = downloadedSongs.filter(s => s.id !== songId);
+      setDownloadedSongs(updated);
+      await AsyncStorage.setItem('downloadedSongs', JSON.stringify(updated));
+      ToastAndroid.show('Download removed', ToastAndroid.SHORT);
+    } catch (e) {
+      console.log('Error deleting downloaded song:', e);
+    }
+  };
+
+  // ===== PLAY COUNT TRACKING =====
+  const loadPlayCounts = async () => {
+    try {
+      const data = await AsyncStorage.getItem('playCounts');
+      if (data) setPlayCounts(JSON.parse(data));
+    } catch (e) {
+      console.log('Error loading play counts:', e);
+    }
+  };
+
+  const incrementPlayCount = async (song) => {
+    try {
+      const updated = { ...playCounts };
+      if (updated[song.id]) {
+        updated[song.id] = { ...updated[song.id], count: updated[song.id].count + 1, song: { id: song.id, name: song.name, artist: song.artist, image: song.image, duration: song.duration, media_url: song.media_url } };
+      } else {
+        updated[song.id] = { count: 1, song: { id: song.id, name: song.name, artist: song.artist, image: song.image, duration: song.duration, media_url: song.media_url } };
+      }
+      setPlayCounts(updated);
+      await AsyncStorage.setItem('playCounts', JSON.stringify(updated));
+    } catch (e) {
+      console.log('Error incrementing play count:', e);
+    }
+  };
+
+  const getMostPlayed = () => {
+    return Object.values(playCounts)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10)
+      .map(item => ({ ...item.song, playCount: item.count }));
+  };
+
+  // ===== SLEEP TIMER =====
+  const startSleepTimer = (minutes) => {
+    // Clear any existing timer
+    if (sleepTimerRef.current) clearInterval(sleepTimerRef.current);
+    
+    if (minutes === 0) {
+      // Cancel timer
+      setSleepTimerActive(false);
+      setSleepTimerMinutes(0);
+      setSleepTimerRemaining(0);
+      setSleepTimerEndOfSong(false);
+      ToastAndroid.show('Sleep timer cancelled', ToastAndroid.SHORT);
+      return;
+    }
+    
+    if (minutes === -1) {
+      // End of current song
+      setSleepTimerEndOfSong(true);
+      setSleepTimerActive(true);
+      setSleepTimerMinutes(0);
+      setSleepTimerRemaining(0);
+      setShowSleepTimerModal(false);
+      ToastAndroid.show('Will stop after current song', ToastAndroid.SHORT);
+      return;
+    }
+    
+    const totalSeconds = minutes * 60;
+    setSleepTimerActive(true);
+    setSleepTimerMinutes(minutes);
+    setSleepTimerRemaining(totalSeconds);
+    setSleepTimerEndOfSong(false);
+    setShowSleepTimerModal(false);
+    ToastAndroid.show(`Sleep timer: ${minutes} minutes`, ToastAndroid.SHORT);
+    
+    sleepTimerRef.current = setInterval(() => {
+      setSleepTimerRemaining(prev => {
+        if (prev <= 1) {
+          // Timer expired — stop playback
+          clearInterval(sleepTimerRef.current);
+          setSleepTimerActive(false);
+          setSleepTimerMinutes(0);
+          if (soundRef.current) {
+            soundRef.current.pauseAsync();
+          }
+          setIsPlaying(false);
+          ToastAndroid.show('Sleep timer: playback stopped', ToastAndroid.LONG);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  // Cleanup sleep timer on unmount
+  useEffect(() => {
+    return () => {
+      if (sleepTimerRef.current) clearInterval(sleepTimerRef.current);
+    };
+  }, []);
+
+  // Handle "end of song" sleep timer
+  useEffect(() => {
+    if (sleepTimerEndOfSong && sleepTimerActive) {
+      // Will be triggered by auto-advance — we intercept it
+    }
+  }, [sleepTimerEndOfSong, sleepTimerActive]);
+
+  const formatTimerDisplay = (totalSeconds) => {
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
+  };
+
+  // ===== PLAYBACK SPEED =====
+  const changePlaybackSpeed = async (speed) => {
+    setPlaybackSpeed(speed);
+    setShowSpeedModal(false);
+    if (soundRef.current) {
+      try {
+        await soundRef.current.setRateAsync(speed, true);
+      } catch (e) {
+        console.log('Error setting playback speed:', e);
+      }
+    }
+    ToastAndroid.show(`Speed: ${speed}x`, ToastAndroid.SHORT);
+  };
+
+  // ===== QUICK PICKS / SUGGESTIONS =====
+  const fetchQuickPicks = async () => {
+    if (loadingQuickPicks) return;
+    setLoadingQuickPicks(true);
+    try {
+      // Get unique artists from recently played
+      const artists = [...new Set(recentlyPlayed.slice(0, 5).map(s => s.artist).filter(Boolean))];
+      let picks = [];
+      // Fetch suggestions based on recently played songs  
+      for (const song of recentlyPlayed.slice(0, 3)) {
+        try {
+          const res = await fetch(`${API_BASE}/song/similar/?id=${song.id}`);
+          const data = await res.json();
+          if (data && data.length > 0) {
+            const similar = data.slice(0, 4).map(s => ({
+              id: s.id,
+              name: s.song || s.name || 'Unknown',
+              artist: s.primary_artists || s.artist || 'Unknown Artist',
+              image: s.image || 'https://via.placeholder.com/150',
+              duration: s.duration || 240,
+              media_url: s.media_url || '',
+              ...s
+            }));
+            picks.push(...similar);
+          }
+        } catch (e) { /* skip */ }
+      }
+      // Deduplicate and remove songs already in recently played
+      const recentIds = new Set(recentlyPlayed.map(s => s.id));
+      picks = dedupeSongs(picks).filter(s => !recentIds.has(s.id)).slice(0, 12);
+      setQuickPicks(picks);
+    } catch (e) {
+      console.log('Error fetching quick picks:', e);
+    }
+    setLoadingQuickPicks(false);
+  };
+
+  // Fetch quick picks when recently played changes (but only once)
+  const quickPicksFetched = useRef(false);
+  useEffect(() => {
+    if (recentlyPlayed.length > 0 && !quickPicksFetched.current) {
+      quickPicksFetched.current = true;
+      fetchQuickPicks();
+    }
+  }, [recentlyPlayed]);
+
+  // Initialize audio mode
+  const initializeAudio = async () => {
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        staysActiveInBackground: true, // KEY: allows background playback
+      });
+    } catch (e) {
+      console.log('Error initializing audio:', e);
+    }
+  };
+
+  // Setup notifications for player controls
+  const setupNotifications = async () => {
+    try {
+      // Set notification handler
+      Notifications.setNotificationHandler({
+        handleNotification: async () => ({
+          shouldShowAlert: false,
+          shouldPlaySound: false,
+          shouldSetBadge: false,
+        }),
+      });
+
+      // Handle notification response (when user taps on notification)
+      const subscription = Notifications.addNotificationResponseReceivedListener(async (response) => {
+        console.log('Notification tapped');
+        if (activeTab !== 'player') {
+          setActiveTab('player');
+          setNavigationStack(['home', 'player']);
+        }
+      });
+
+      return () => {
+        subscription.remove();
+      };
+    } catch (e) {
+      console.log('Error setting up notifications:', e);
+    }
+  };
+
+  // Update or show playback notification
+  const updatePlaybackNotification = async () => {
+    try {
+      if (!currentSong) {
+        await Notifications.dismissAllNotificationsAsync();
+        return;
+      }
+
+      const buttonTitle = isPlaying ? '⏸ Pause' : '▶ Play';
+      const notificationId = await Notifications.scheduleNotificationAsync({
+        content: {
+          title: currentSong.name,
+          subtitle: currentSong.artist,
+          body: isPlaying ? 'Now playing...' : 'Paused',
+          data: {
+            songId: currentSong.id,
+          },
+          badge: 1,
+          launchImageName: currentSong.image,
+        },
+        trigger: null, // Show immediately
+      });
+
+      return notificationId;
+    } catch (e) {
+      console.log('Error updating notification:', e);
+    }
+  };
+
+  // AppState listener for background playback
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    return () => subscription.remove();
+  }, []);
+
+  // Update notification when song or play state changes
+  useEffect(() => {
+    updatePlaybackNotification();
+  }, [currentSong, isPlaying]);
+
+  const handleAppStateChange = async (nextAppState) => {
+    appState.current = nextAppState;
+    console.log('🎵 Background Audio Status:', { state: nextAppState, isPlaying, hasSong: !!currentSong, timestamp: new Date().toLocaleTimeString() });
+    if (nextAppState === 'active') {
+      // App came to foreground - resume audio if it was playing
+      if (soundRef.current && isPlayingRef.current) {
+        try {
+          console.log('📱 Resuming audio from foreground');
+          await soundRef.current.playAsync();
+        } catch (e) {
+          console.log('Error resuming audio:', e);
+        }
+      }
+    } else if (nextAppState === 'background') {
+      console.log('🔄 App backgrounded - audio should continue playing with staysActiveInBackground');
+    }
+  };
+
+  // Back button handler
+  useEffect(() => {
+    const backAction = () => {
+      // If inside a playlist, exit the playlist first
+      if (selectedPlaylist) {
+        setSelectedPlaylist(null);
+        return true;
+      }
+      
+      // Otherwise handle navigation stack
+      if (navigationStack.length > 1) {
+        const newStack = navigationStack.slice(0, -1);
+        setNavigationStack(newStack);
+        setActiveTab(newStack[newStack.length - 1]);
+        return true;
+      }
+      return false;
+    };
+
+    const backHandler = BackHandler.addEventListener(
+      'hardwareBackPress',
+      backAction,
+    );
+
+    return () => backHandler.remove();
+  }, [navigationStack, selectedPlaylist]);
+
+  // Auto-advance reference to track if we've already triggered auto-advance for current song
+  const autoAdvanceTriggeredRef = useRef(false);
+  const soundRef = useRef(null);
+  const sleepTimerEndOfSongRef = useRef(false);
+
+  // Keep sleep timer ref in sync
+  useEffect(() => { sleepTimerEndOfSongRef.current = sleepTimerEndOfSong; }, [sleepTimerEndOfSong]);
+
+  // Update soundRef whenever sound changes so callbacks have access to it
+  useEffect(() => {
+    soundRef.current = sound;
+  }, [sound]);
+
+  // Setup auto-advance callback when song changes
+  useEffect(() => {
+    if (!sound || !currentSong) return;
+    
+    autoAdvanceTriggeredRef.current = false;
+    let realDuration = currentSong.duration ? parseInt(currentSong.duration) : 240;
+    
+    // Set up playback status callback for background auto-advance
+    // Uses REFS (not state) to avoid stale closures — this is critical for correct behavior
+    sound.setOnPlaybackStatusUpdate(async (status) => {
+      try {
+        if (status.isLoaded && !autoAdvanceTriggeredRef.current) {
+          const currentPos = status.positionMillis / 1000;
+          const dur = status.durationMillis ? status.durationMillis / 1000 : realDuration;
+          
+          // Check if song has finished (works in background too)
+          if (status.didJustFinish || currentPos >= dur - 0.5) {
+            autoAdvanceTriggeredRef.current = true;
+            console.log('🎵 Song finished, auto-advancing...');
+            
+            // Sleep timer: end of song mode — stop playback instead of advancing
+            if (sleepTimerEndOfSongRef.current) {
+              setSleepTimerActive(false);
+              setSleepTimerEndOfSong(false);
+              setIsPlaying(false);
+              ToastAndroid.show('Sleep timer: playback stopped', ToastAndroid.LONG);
+              return;
+            }
+            
+            if (repeatRef.current === 'one') {
+              // Repeat one song — use ref for current song
+              playSong(currentSongRef.current, queueContextRef.current);
+            } else {
+              // Move to next song — handleAutoAdvanceFromRef reads all values from refs
+              handleAutoAdvanceFromRef();
+            }
+          }
+        }
+      } catch (e) {
+        console.log('Error in playback status update:', e);
+      }
+    });
+    
+    return () => {
+      autoAdvanceTriggeredRef.current = false;
+    };
+  }, [sound, currentSong]);
+
+  // Auto-advance using REFS — avoids stale closure problem
+  const handleAutoAdvanceFromRef = async () => {
+    const song = currentSongRef.current;
+    const context = queueContextRef.current;
+    const isAutoPlay = autoPlaySimilarRef.current;
+    const isShuffle = shuffleRef.current;
+    
+    let contextQueue = queueRef.current;
+    if (context === 'liked') {
+      contextQueue = likedSongsRef.current;
+    } else if (context?.startsWith('playlist-')) {
+      const playlistId = context.replace('playlist-', '');
+      const playlist = playlistsRef.current.find(p => p.id === playlistId);
+      contextQueue = playlist?.songs || queueRef.current;
+    }
+    
+    if (!contextQueue || contextQueue.length === 0) {
+      // No queue — try auto-play similar
+      if (isAutoPlay && song) {
+        await fetchAndPlaySimilar(song);
+      }
+      return;
+    }
+    
+    // Calculate next index
+    const currentIndex = contextQueue.findIndex(s => s.id === song?.id);
+    let nextIndex;
+    if (isShuffle) {
+      nextIndex = Math.floor(Math.random() * contextQueue.length);
+    } else {
+      nextIndex = currentIndex + 1;
+    }
+    
+    if (nextIndex >= contextQueue.length) {
+      // End of queue — fetch similar if auto-play is on and not a fixed context
+      if (isAutoPlay && song && context !== 'liked' && context !== 'downloaded' && !context?.startsWith('playlist-')) {
+        await fetchAndPlaySimilar(song);
+      }
+      return;
+    }
+    
+    playSong(contextQueue[nextIndex], context);
+  };
+
+  // Fetch similar songs and play the first one
+  const fetchAndPlaySimilar = async (song) => {
+    try {
+      const res = await fetch(`${API_BASE}/song/similar/?id=${song.id}`);
+      const data = await res.json();
+      if (data && data.length > 0) {
+        const currentSongName = (song.name || '').toLowerCase().trim();
+        const similarSongs = dedupeSongs(
+          data.slice(0, 6)
+            .filter(s => (s.song || s.name || '').toLowerCase().trim() !== currentSongName)
+            .map(s => ensureUniqueId({
+              id: s.id,
+              name: s.song || s.name || 'Unknown',
+              artist: s.primary_artists || s.artist || 'Unknown Artist',
+              image: s.image || 'https://via.placeholder.com/150',
+              duration: s.duration || 240,
+              media_url: s.media_url || '',
+              ...s
+            }))
+        );
+        if (similarSongs.length > 0) {
+          setQueue(prev => {
+            const appended = dedupeSongs([...(prev || []), ...similarSongs]);
+            return appended;
+          });
+          console.log('🎵 Auto-play: playing similar song:', similarSongs[0].name);
+          playSong(similarSongs[0], null);
+        }
+      }
+    } catch (e) {
+      console.log('Error fetching similar songs for auto-play:', e);
+    }
+  };
+
+  const searchSongs = async () => {
+    if (!searchQuery.trim()) {
+      Alert.alert('Error', 'Please enter a song name');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/song/?query=${encodeURIComponent(searchQuery)}`);
+      const data = await response.json();
+      
+      // Backend returns array directly, normalize the field names
+      const songs = Array.isArray(data) ? data : data.results || [];
+      const normalizedSongs = songs.map(song => ({
+        id: song.id,
+        name: song.song || song.name || 'Unknown',
+        artist: song.primary_artists || song.artist || 'Unknown Artist',
+        image: song.image || 'https://via.placeholder.com/150',
+        duration: song.duration || 240,
+        media_url: song.media_url || '',
+        ...song // Keep all other properties
+      }));
+      
+      setSongs(normalizedSongs);
+    } catch (error) {
+      Alert.alert('Error', 'Could not search songs. Make sure backend is running.');
+      console.error(error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const playSong = async (song, context = null) => {
+    // ✅ Prevent simultaneous playback with a lock
+    if (playbackLockRef.current) {
+      console.log('⏳ Playback lock active, skipping duplicate playSong call');
+      return;
+    }
+    playbackLockRef.current = true;
+    
+    try {
+      // Clear any existing interval first
+      if (playbackIntervalId) clearInterval(playbackIntervalId);
+      
+      // ✅ Stop previous sound using BOTH state and ref to ensure cleanup
+      // This prevents two songs from playing simultaneously
+      const prevSound = soundRef.current;
+      if (prevSound) {
+        try {
+          await prevSound.stopAsync();
+          await prevSound.unloadAsync();
+        } catch (e) {
+          console.log('Error stopping previous sound:', e);
+        }
+        soundRef.current = null;
+        setSound(null);
+      }
+      
+      // Also stop the state-based sound reference (belt-and-suspenders)
+      if (sound && sound !== prevSound) {
+        try {
+          await sound.stopAsync();
+          await sound.unloadAsync();
+        } catch (e) {
+          console.log('Error stopping state sound:', e);
+        }
+      }
+      
+      // Check if song has a playable URL (could be offline song with localUri)
+      const playUri = song.localUri || song.media_url;
+      if (!playUri) {
+        Alert.alert('Error', 'No media URL available for this song.');
+        return;
+      }
+      
+      // Add to recently played
+      addToRecentlyPlayed(song);
+      
+      // Track play count
+      incrementPlayCount(song);
+      
+      // Ensure unique ID for this song instance
+      const songWithId = ensureUniqueId({...song});
+      
+      // Update state
+      setCurrentSong(songWithId);
+      setIsPlaying(false);
+      setShowQueue(false);
+      setProgress(0);
+      setCurrentTime('0:00');
+      setIsDraggingSeek(false);
+      
+      // Set queue context if provided (for liked songs or playlists)
+      if (context) {
+        setQueueContext(context);
+        if (context === 'liked') {
+          setQueue(likedSongs);
+        } else if (context?.startsWith('playlist-')) {
+          const playlistId = context.replace('playlist-', '');
+          const playlist = playlists.find(p => p.id === playlistId);
+          if (playlist?.songs) {
+            setQueue(playlist.songs);
+          }
+        } else {
+          setQueue([songWithId]);
+        }
+      } else {
+        // If no context, treat as single song queue
+        setQueue([songWithId]);
+        // If auto-play is on, fetch similar songs and add to queue
+        if (autoPlaySimilar && songWithId && (!queue || queue.length <= 1)) {
+          try {
+            const res = await fetch(`${API_BASE}/song/similar/?id=${songWithId.id}`);
+            const data = await res.json();
+            if (data && data.length > 0) {
+              const similarSongs = data.slice(0, 6).map(nextSong => ({
+                id: nextSong.id,
+                name: nextSong.song || nextSong.name || 'Unknown',
+                artist: nextSong.primary_artists || nextSong.artist || 'Unknown Artist',
+                image: nextSong.image || 'https://via.placeholder.com/150',
+                duration: nextSong.duration || 240,
+                media_url: nextSong.media_url || '',
+                ...nextSong
+              }));
+              setQueue([song, ...similarSongs]);
+            }
+          } catch (e) {
+            console.log('Error fetching similar songs for auto-play:', e);
+          }
+        }
+      }
+      
+      // Parse duration from song
+      const songDur = parseInt(song.duration || 240);
+      setDuration(songDur);
+      setSongDuration(formatTime(songDur));
+      
+      // Update navigation stack
+      if (!navigationStack.includes('player')) {
+        setNavigationStack([...navigationStack, 'player']);
+      }
+      setActiveTab('player');
+      
+      // Load and play audio
+      const { sound: newSound } = await Audio.Sound.createAsync(
+        { uri: playUri },
+        { shouldPlay: true, volume: 1 }
+      );
+      
+      // ✅ Set ref FIRST (before state) so callbacks always have current reference
+      soundRef.current = newSound;
+      setSound(newSound);
+      setIsPlaying(true);
+      setShowMiniPlayer(true);
+      
+      // Apply current playback speed
+      if (playbackSpeed !== 1.0) {
+        try { await newSound.setRateAsync(playbackSpeed, true); } catch (e) { /* ignore */ }
+      }
+      
+      // Fetch real duration from audio engine
+      let realDuration = song.duration ? parseInt(song.duration) : 240;
+      try {
+        const status = await newSound.getStatusAsync();
+        if (status.isLoaded && status.durationMillis) {
+          realDuration = status.durationMillis / 1000;
+        }
+      } catch (e) { console.log('Error fetching real duration:', e); }
+      setDuration(realDuration);
+      setSongDuration(formatTime(realDuration));
+      
+      // Set up progress update interval for UI updates
+      const interval = setInterval(async () => {
+        try {
+          if (!soundRef.current) return;
+          const status = await soundRef.current.getStatusAsync();
+          if (status.isLoaded) {
+            let currentPos = status.positionMillis / 1000;
+            let dur = status.durationMillis ? status.durationMillis / 1000 : realDuration;
+            if (dur && currentPos > dur) currentPos = dur;
+            if (!isDraggingSeek) {
+              setProgress(currentPos);
+              setCurrentTime(formatTime(Math.floor(currentPos)));
+            }
+          }
+        } catch (e) {
+          console.log('Error updating progress:', e);
+        }
+      }, 250);
+      setPlaybackIntervalId(interval);
+      
+    } catch (error) {
+      Alert.alert('Error', 'Could not load song. Please try another song.');
+      console.error('Error loading sound:', error);
+    } finally {
+      // ✅ Always release the lock
+      playbackLockRef.current = false;
+    }
+  };
+
+  const formatTime = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+  };
+
+  const playNext = async () => {
+    let contextQueue = queue;
+    if (queueContext === 'liked') {
+      contextQueue = likedSongs;
+    } else if (queueContext?.startsWith('playlist-')) {
+      const playlistId = queueContext.replace('playlist-', '');
+      const playlist = playlists.find(p => p.id === playlistId);
+      contextQueue = playlist?.songs || queue;
+    }
+    if (!contextQueue || contextQueue.length === 0) {
+      if (autoPlaySimilar && currentSong) {
+        await fetchAndPlaySimilar(currentSong);
+      }
+      return;
+    }
+    const currentIndex = contextQueue.findIndex(s => s.id === currentSong?.id);
+    let nextIndex;
+    if (shuffle) {
+      nextIndex = Math.floor(Math.random() * contextQueue.length);
+    } else {
+      nextIndex = currentIndex + 1;
+    }
+    if (nextIndex >= contextQueue.length) {
+      if (autoPlaySimilar && currentSong && queueContext !== 'liked' && queueContext !== 'downloaded' && !queueContext?.startsWith('playlist-')) {
+        await fetchAndPlaySimilar(currentSong);
+      }
+      return;
+    }
+    playSong(contextQueue[nextIndex], queueContext);
+  };
+
+  const playPrevious = () => {
+    if (queue.length === 0) return;
+    if (playbackIntervalId) clearInterval(playbackIntervalId);
+    
+    let contextQueue = queue;
+    
+    // Use context-specific queue if available
+    if (queueContext === 'liked') {
+      contextQueue = likedSongs;
+    } else if (queueContext?.startsWith('playlist-')) {
+      const playlistId = queueContext.replace('playlist-', '');
+      const playlist = playlists.find(p => p.id === playlistId);
+      contextQueue = playlist?.songs || queue;
+    }
+    
+    const currentIndex = contextQueue.findIndex(s => s.id === currentSong?.id);
+    const previousIndex = (currentIndex - 1 + contextQueue.length) % contextQueue.length;
+    playSong(contextQueue[previousIndex], queueContext);
+  };
+
+  const toggleRepeat = () => {
+    const modes = ['off', 'all', 'one'];
+    const currentIndex = modes.indexOf(repeat);
+    const nextIndex = (currentIndex + 1) % modes.length;
+    setRepeat(modes[nextIndex]);
+  };
+
+  const toggleShuffle = () => {
+    setShuffle(!shuffle);
+  };
+
+  // Recently played songs management
+  const loadRecentlyPlayed = async () => {
+    try {
+      const data = await AsyncStorage.getItem('recentlyPlayed');
+      if (data) {
+        setRecentlyPlayed(JSON.parse(data));
+      }
+    } catch (e) {
+      console.log('Error loading recently played:', e);
+    }
+  };
+
+  const addToRecentlyPlayed = async (song) => {
+    try {
+      const updated = [song, ...recentlyPlayed.filter(s => s.id !== song.id)].slice(0, 20);
+      setRecentlyPlayed(updated);
+      await AsyncStorage.setItem('recentlyPlayed', JSON.stringify(updated));
+    } catch (e) {
+      console.log('Error adding to recently played:', e);
+    }
+  };
+
+  const removeFromRecentlyPlayed = async (songId) => {
+    try {
+      const updated = recentlyPlayed.filter(s => s.id !== songId);
+      setRecentlyPlayed(updated);
+      await AsyncStorage.setItem('recentlyPlayed', JSON.stringify(updated));
+      Alert.alert('Success', 'Removed from recently played');
+    } catch (e) {
+      console.log('Error removing from recently played:', e);
+      Alert.alert('Error', 'Could not remove from recently played');
+    }
+  };
+
+  const likeSong = async (song) => {
+    try {
+      const isAlreadyLiked = likedSongs.find(s => s.id === song.id);
+      let updatedLikedSongs;
+      if (isAlreadyLiked) {
+        updatedLikedSongs = likedSongs.filter(s => s.id !== song.id);
+      } else {
+        updatedLikedSongs = [...likedSongs, ensureUniqueId(song)];
+      }
+      setLikedSongs(updatedLikedSongs);
+      await AsyncStorage.setItem('likedSongs', JSON.stringify(updatedLikedSongs));
+    } catch (e) {
+      console.log('Error toggling like:', e);
+    }
+  };
+
+  // Seek functionality with drag support
+  const handleSeekDragStart = () => {
+    setIsDraggingSeek(true);
+    if (playbackIntervalId) clearInterval(playbackIntervalId);
+  };
+
+  const handleSeekDrag = (positionX, trackWidth) => {
+    if (!duration) return;
+    const percentage = Math.max(0, Math.min(1, positionX / trackWidth));
+    const newPosition = percentage * duration;
+    setSeekingPosition(newPosition);
+    setProgress(newPosition); // update green segment immediately
+    setCurrentTime(formatTime(Math.floor(newPosition)));
+  };
+
+  const handleSeekDragEnd = async () => {
+    setIsDraggingSeek(false);
+    if (soundRef.current && seekingPosition >= 0) {
+      try {
+        await soundRef.current.setPositionAsync(seekingPosition * 1000);
+        // After seeking, immediately update UI from audio engine
+        const status = await soundRef.current.getStatusAsync();
+        if (status.isLoaded) {
+          let currentPos = status.positionMillis / 1000;
+          let dur = status.durationMillis ? status.durationMillis / 1000 : duration;
+          if (dur && currentPos > dur) currentPos = dur;
+          setProgress(currentPos);
+          setCurrentTime(formatTime(Math.floor(currentPos)));
+          // If seeked to end, trigger next/loop
+          if (dur && Math.abs(currentPos - dur) < 0.5) {
+            if (repeat === 'one') {
+              playSong(currentSong, queueContext);
+            } else {
+              playNext();
+            }
+            return;
+          }
+        }
+        // Restart progress interval for immediate sync
+        if (playbackIntervalId) clearInterval(playbackIntervalId);
+        const newInterval = setInterval(async () => {
+          try {
+            if (!soundRef.current) return;
+            const status = await soundRef.current.getStatusAsync();
+            if (status.isLoaded) {
+              let currentPos = status.positionMillis / 1000;
+              let dur = status.durationMillis ? status.durationMillis / 1000 : duration;
+              if (dur && currentPos > dur) currentPos = dur;
+              setProgress(currentPos);
+              setCurrentTime(formatTime(Math.floor(currentPos)));
+              if (status.didJustFinish || (dur && Math.abs(currentPos - dur) < 0.5)) {
+                setProgress(0);
+                setCurrentTime('0:00');
+              }
+            }
+          } catch (e) {
+            console.log('Error updating progress:', e);
+          }
+        }, 250);
+        setPlaybackIntervalId(newInterval);
+      } catch (e) {
+        console.log('Error seeking:', e);
+      }
+    }
+  };
+
+  const handleSeekTap = async (positionX, trackWidth) => {
+    if (!soundRef.current || !duration) return;
+    const percentage = Math.max(0, Math.min(1, positionX / trackWidth));
+    const newPosition = percentage * duration;
+    try {
+      await soundRef.current.setPositionAsync(newPosition * 1000);
+      setProgress(newPosition);
+      setCurrentTime(formatTime(Math.floor(newPosition)));
+      setSeekingPosition(newPosition);
+      // Restart progress interval for immediate sync
+      if (playbackIntervalId) clearInterval(playbackIntervalId);
+      const newInterval = setInterval(async () => {
+        try {
+          if (!soundRef.current) return;
+          const status = await soundRef.current.getStatusAsync();
+          if (status.isLoaded) {
+            let currentPos = status.positionMillis / 1000;
+            setProgress(currentPos);
+            setCurrentTime(formatTime(Math.floor(currentPos)));
+            if (status.didJustFinish) {
+              setProgress(0);
+              setCurrentTime('0:00');
+            }
+          }
+        } catch (e) {
+          console.log('Error updating progress:', e);
+        }
+      }, 250);
+      setPlaybackIntervalId(newInterval);
+    } catch (e) {
+      console.log('Error tapping seek:', e);
+    }
+  };
+
+  // Queue reordering functions
+  const handleQueueItemPress = (song, index) => {
+    setDraggedQueueItem({ song, index, startY: 0 });
+  };
+
+  const handleMoveQueueItem = async (fromIndex, toIndex) => {
+    if (fromIndex === toIndex) return;
+    const newQueue = [...queue];
+    const [removed] = newQueue.splice(fromIndex, 1);
+    newQueue.splice(toIndex, 0, removed);
+    setQueue(newQueue);
+    
+    // Also update the underlying context (liked songs or playlist) if applicable
+    if (queueContext === 'liked') {
+      const newLikedSongs = [...likedSongs];
+      const [removedSong] = newLikedSongs.splice(fromIndex, 1);
+      newLikedSongs.splice(toIndex, 0, removedSong);
+      setLikedSongs(newLikedSongs);
+      await AsyncStorage.setItem('likedSongs', JSON.stringify(newLikedSongs));
+    } else if (queueContext?.startsWith('playlist-')) {
+      const playlistId = queueContext.replace('playlist-', '');
+      const updatedPlaylists = playlists.map(p => {
+        if (p.id === playlistId) {
+          const newSongs = [...(p.songs || [])];
+          const [removedSong] = newSongs.splice(fromIndex, 1);
+          newSongs.splice(toIndex, 0, removedSong);
+          return { ...p, songs: newSongs };
+        }
+        return p;
+      });
+      setPlaylists(updatedPlaylists);
+      await AsyncStorage.setItem('playlists', JSON.stringify(updatedPlaylists));
+      // Update selected playlist if it's the one being modified
+      if (selectedPlaylist?.id === playlistId) {
+        const updatedPlaylist = updatedPlaylists.find(p => p.id === playlistId);
+        setSelectedPlaylist(updatedPlaylist);
+      }
+    }
+  };
+
+  const moveQueueItemUp = (index) => {
+    if (index > 0) {
+      handleMoveQueueItem(index, index - 1);
+    }
+  };
+
+  const moveQueueItemDown = (index) => {
+    if (index < queue.length - 1) {
+      handleMoveQueueItem(index, index + 1);
+    }
+  };
+
+  const removeQueueItem = (index) => {
+    // Only remove from the display queue, NOT from the underlying context
+    const newQueue = [...queue];
+    const removedSong = newQueue[index];
+    newQueue.splice(index, 1);
+    setQueue(newQueue);
+    
+    // If the removed song is currently playing, it will be handled by the auto-advance logic
+    if (currentSong && currentSong.id === removedSong.id && newQueue.length > 0) {
+      // Auto-advance to next song
+      playNext();
+    }
+  };
+
+  const loadLikedSongs = async () => {
+    try {
+      const stored = await AsyncStorage.getItem('likedSongs');
+      if (stored) {
+        setLikedSongs(JSON.parse(stored));
+      }
+    } catch (error) {
+      console.error('Error loading liked songs:', error);
+    }
+  };
+
+  const createPlaylist = async () => {
+    if (!newPlaylistName.trim()) {
+      Alert.alert('Error', 'Please enter a playlist name');
+      return;
+    }
+
+    try {
+      const newPlaylist = {
+        id: Date.now().toString(),
+        name: newPlaylistName,
+        songs: [],
+      };
+
+      const updatedPlaylists = [...playlists, newPlaylist];
+      setPlaylists(updatedPlaylists);
+      await AsyncStorage.setItem('playlists', JSON.stringify(updatedPlaylists));
+      setNewPlaylistName('');
+      Alert.alert('Success', 'Playlist created!');
+    } catch (error) {
+      Alert.alert('Error', 'Could not create playlist');
+    }
+  };
+
+  const loadPlaylists = async () => {
+    try {
+      const stored = await AsyncStorage.getItem('playlists');
+      if (stored) {
+        setPlaylists(JSON.parse(stored));
+      }
+    } catch (error) {
+      console.error('Error loading playlists:', error);
+    }
+  };
+
+  const addToPlaylist = async (song, playlistId) => {
+    try {
+      const originalPlaylist = playlists.find(p => p.id === playlistId);
+      
+      // Check if song already exists in this specific playlist
+      const songExists = (originalPlaylist?.songs || []).some(s => s.id === song.id);
+      if (songExists) {
+        // Show toast message only for duplicates
+        ToastAndroid.show('Song already exists in this playlist', ToastAndroid.SHORT);
+        return;
+      }
+      
+      const updatedPlaylists = playlists.map(p => {
+        if (p.id === playlistId) {
+          return {
+            ...p,
+            songs: [...(p.songs || []), ensureUniqueId(song)],
+          };
+        }
+        return p;
+      });
+
+      setPlaylists(updatedPlaylists);
+      await AsyncStorage.setItem('playlists', JSON.stringify(updatedPlaylists));
+      Alert.alert('Success', 'Song added to playlist!');
+    } catch (error) {
+      Alert.alert('Error', 'Could not add to playlist');
+    }
+  };
+
+  const removeFromPlaylist = async (songId, playlistId) => {
+    try {
+      const updatedPlaylists = playlists.map(p => {
+        if (p.id === playlistId) {
+          return {
+            ...p,
+            songs: (p.songs || []).filter(s => s.id !== songId),
+          };
+        }
+        return p;
+      });
+
+      setPlaylists(updatedPlaylists);
+      
+      // Update selectedPlaylist if it's the one being modified
+      if (selectedPlaylist?.id === playlistId) {
+        const updatedSelected = updatedPlaylists.find(p => p.id === playlistId);
+        setSelectedPlaylist(updatedSelected);
+      }
+      
+      await AsyncStorage.setItem('playlists', JSON.stringify(updatedPlaylists));
+      Alert.alert('Success', 'Song removed from playlist');
+    } catch (error) {
+      Alert.alert('Error', 'Could not remove from playlist');
+    }
+  };
+
+  const updatePlaylistName = async (playlistId, newName) => {
+    if (!newName.trim()) {
+      Alert.alert('Error', 'Playlist name cannot be empty');
+      return;
+    }
+
+    try {
+      const updatedPlaylists = playlists.map(p => {
+        if (p.id === playlistId) {
+          return { ...p, name: newName.trim() };
+        }
+        return p;
+      });
+
+      setPlaylists(updatedPlaylists);
+      
+      // Update selectedPlaylist if it's the one being modified
+      if (selectedPlaylist?.id === playlistId) {
+        const updatedSelected = updatedPlaylists.find(p => p.id === playlistId);
+        setSelectedPlaylist(updatedSelected);
+      }
+      
+      await AsyncStorage.setItem('playlists', JSON.stringify(updatedPlaylists));
+      Alert.alert('Success', 'Playlist name updated');
+    } catch (error) {
+      Alert.alert('Error', 'Could not update playlist name');
+    }
+  };
+
+  const deletePlaylist = async (playlistId) => {
+    Alert.alert('Delete Playlist', 'Are you sure?', [
+      { text: 'Cancel', onPress: () => {} },
+      {
+        text: 'Delete',
+        onPress: async () => {
+          try {
+            const updatedPlaylists = playlists.filter(p => p.id !== playlistId);
+            setPlaylists(updatedPlaylists);
+            await AsyncStorage.setItem('playlists', JSON.stringify(updatedPlaylists));
+            setSelectedPlaylist(null);
+            setShowPlaylistDetail(false);
+            Alert.alert('Success', 'Playlist deleted!');
+          } catch (error) {
+            Alert.alert('Error', 'Could not delete playlist');
+          }
+        },
+      },
+    ]);
+  };
+
+  const formatLyrics = (rawLyrics) => {
+    if (!rawLyrics) return [];
+    // Remove HTML br tags and split into lines
+    let formatted = rawLyrics.replace(/<br\s*\/?>/gi, '\n');
+    // Split by newlines and filter empty lines
+    const lines = formatted.split('\n').filter(line => line.trim().length > 0);
+    return lines;
+  };
+
+  const fetchLyrics = async (song) => {
+    try {
+      // Use the correct endpoint and field name
+      const songId = song.id || song.song_id;
+      const response = await fetch(`${API_BASE}/lyrics/?query=${encodeURIComponent(songId)}`);
+      const data = await response.json();
+      const rawLyrics = data.lyrics || 'Lyrics not available';
+      setLyrics(rawLyrics);
+      
+      // Format lyrics into lines
+      const formatted = formatLyrics(rawLyrics);
+      setLyricsLines(formatted);
+      setCurrentLyricIndex(-1);
+      setShowLyrics(true);
+    } catch (error) {
+      console.error('Lyrics error:', error);
+      setLyrics('Lyrics not available');
+      setLyricsLines([]);
+      setCurrentLyricIndex(-1);
+      setShowLyrics(true);
+    }
+  };
+
+  // Sync lyrics with song playback
+  useEffect(() => {
+    if (!showLyrics || !currentSong || !soundRef.current || lyricsLines.length === 0) return;
+
+    const syncLyrics = async () => {
+      try {
+        if (!soundRef.current) return;
+        const status = await soundRef.current.getStatusAsync();
+        if (status.isLoaded && duration > 0) {
+          // Estimate which lyric line is being played
+          // For simplicity, distribute lyrics evenly across song duration
+          const progressPercent = status.positionMillis / status.durationMillis;
+          const estimatedLineIndex = Math.floor(progressPercent * lyricsLines.length);
+          
+          if (estimatedLineIndex !== currentLyricIndex && estimatedLineIndex < lyricsLines.length) {
+            setCurrentLyricIndex(estimatedLineIndex);
+          }
+        }
+      } catch (e) {
+        console.log('Error syncing lyrics:', e);
+      }
+    };
+
+    const syncInterval = setInterval(syncLyrics, 500);
+    return () => clearInterval(syncInterval);
+  }, [showLyrics, currentSong, lyricsLines, duration]);
+
+  const removeFromQueue = (songId) => {
+    const updatedQueue = queue.filter(s => s.id !== songId);
+    setQueue(updatedQueue);
+    
+    // If we're removing the current song, play the next one
+    if (currentSong && currentSong.id === songId && updatedQueue.length > 0) {
+      setCurrentSong(updatedQueue[0]);
+    }
+  };
+
+  const queuePosition = currentSong ? queue.findIndex(s => s.id === currentSong.id) + 1 : 0;
+
+  // Reusable bottom navigation bar
+  const renderBottomNav = () => (
+    <View style={styles.bottomNav}>
+      <TouchableOpacity style={[styles.navItem, activeTab === 'home' && styles.activeNav]} onPress={() => { setNavigationStack(['home']); setActiveTab('home'); }}>
+        <Ionicons name={activeTab === 'home' ? 'home' : 'home-outline'} size={24} color={activeTab === 'home' ? '#1DB954' : '#888'} />
+        <Text style={[styles.navLabel, activeTab === 'home' && styles.activeNavLabel]}>Home</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={[styles.navItem, activeTab === 'player' && styles.activeNav]} onPress={() => { setNavigationStack(['home', 'player']); setActiveTab('player'); }}>
+        <Ionicons name={activeTab === 'player' ? 'musical-notes' : 'musical-notes-outline'} size={24} color={activeTab === 'player' ? '#1DB954' : '#888'} />
+        <Text style={[styles.navLabel, activeTab === 'player' && styles.activeNavLabel]}>Player</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={[styles.navItem, activeTab === 'liked' && styles.activeNav]} onPress={() => { setNavigationStack(['home', 'liked']); setActiveTab('liked'); }}>
+        <Ionicons name={activeTab === 'liked' ? 'heart' : 'heart-outline'} size={24} color={activeTab === 'liked' ? '#1DB954' : '#888'} />
+        <Text style={[styles.navLabel, activeTab === 'liked' && styles.activeNavLabel]}>Liked</Text>
+      </TouchableOpacity>
+      <TouchableOpacity style={[styles.navItem, activeTab === 'playlists' && styles.activeNav]} onPress={() => { setNavigationStack(['home', 'playlists']); setActiveTab('playlists'); }}>
+        <Ionicons name={activeTab === 'playlists' ? 'library' : 'library-outline'} size={24} color={activeTab === 'playlists' ? '#1DB954' : '#888'} />
+        <Text style={[styles.navLabel, activeTab === 'playlists' && styles.activeNavLabel]}>Library</Text>
+      </TouchableOpacity>
+    </View>
+  );
+
+  // Render song card
+  const renderMiniPlayer = () => {
+    if (!currentSong || activeTab === 'player' || !showMiniPlayer) return null;
+
+    return (
+      <TouchableOpacity
+        style={styles.miniPlayer}
+        onPress={() => setActiveTab('player')}
+        activeOpacity={0.9}
+      >
+        <LinearGradient
+          colors={['#1DB954', '#148a3c']}
+          style={styles.miniPlayerGradient}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 0 }}
+        >
+          {/* Mini progress bar */}
+          <View style={styles.miniProgressBar}>
+            <View style={[styles.miniProgressFill, { width: `${duration > 0 ? (progress / duration) * 100 : 0}%` }]} />
+          </View>
+          <View style={styles.miniPlayerContent}>
+            <Image
+              source={{ uri: currentSong.image || 'https://via.placeholder.com/40' }}
+              style={styles.miniPlayerImage}
+            />
+            <View style={styles.miniPlayerInfo}>
+              <Text style={styles.miniPlayerSongName} numberOfLines={1}>{currentSong.name}</Text>
+              <Text style={styles.miniPlayerArtist} numberOfLines={1}>{currentSong.artist}</Text>
+            </View>
+            <TouchableOpacity
+              onPress={(e) => {
+                e.stopPropagation();
+                playPrevious();
+              }}
+              style={styles.miniPlayerBtn}
+            >
+              <Ionicons name="play-skip-back" size={20} color="#FFF" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={(e) => {
+                e.stopPropagation();
+                if (soundRef.current) {
+                  if (isPlaying) {
+                    soundRef.current.pauseAsync();
+                  } else {
+                    soundRef.current.playAsync();
+                  }
+                  setIsPlaying(!isPlaying);
+                }
+              }}
+              style={styles.miniPlayerBtn}
+            >
+              <Ionicons name={isPlaying ? 'pause' : 'play'} size={22} color="#FFF" />
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={(e) => {
+                e.stopPropagation();
+                playNext();
+              }}
+              style={styles.miniPlayerBtn}
+            >
+              <Ionicons name="play-skip-forward" size={20} color="#FFF" />
+            </TouchableOpacity>
+          </View>
+        </LinearGradient>
+      </TouchableOpacity>
+    );
+  };
+
+  const renderSongCard = (song, context = null) => (
+    <Pressable
+      style={styles.songCard}
+      onPress={() => playSong(song, context)}
+      onLongPress={() => {
+        setSelectedMenuSong(song);
+        setShowSongMenu(true);
+      }}
+    >
+      <View style={styles.songImageContainer}>
+        <Image
+          source={{ uri: song.image || 'https://via.placeholder.com/150' }}
+          style={styles.songImage}
+        />
+        {/* Play overlay */}
+        <View style={styles.playOverlay}>
+          <View style={styles.playIconBg}>
+            <Ionicons name="play" size={22} color="#FFF" />
+          </View>
+        </View>
+        {/* Like button on image */}
+        <TouchableOpacity
+          onPress={() => likeSong(song)}
+          style={styles.likeButton}
+        >
+          <Ionicons
+            name={likedSongs.find(s => s.id === song.id) ? 'heart' : 'heart-outline'}
+            size={20}
+            color={likedSongs.find(s => s.id === song.id) ? '#FF4D6D' : '#FFF'}
+          />
+        </TouchableOpacity>
+        {/* 3-dot menu on image */}
+        <TouchableOpacity
+          onPress={() => {
+            setSelectedThreeDotSong(song);
+            setShowThreeDotMenu(true);
+          }}
+          style={styles.threeDotsButton}
+        >
+          <MaterialIcons name="more-vert" size={20} color="#FFF" />
+        </TouchableOpacity>
+        {/* Duration badge */}
+        {song.duration && (
+          <View style={styles.durationBadge}>
+            <Text style={styles.durationBadgeText}>{formatTime(parseInt(song.duration))}</Text>
+          </View>
+        )}
+      </View>
+      <View style={styles.songInfo}>
+        <Text style={styles.songName} numberOfLines={1}>{song.name}</Text>
+        <Text style={styles.artistName} numberOfLines={1}>{song.artist}</Text>
+      </View>
+      {/* Now playing indicator */}
+      {currentSong && currentSong.id === song.id && (
+        <View style={styles.nowPlayingIndicator}>
+          <View style={[styles.nowPlayingBar, { height: 8 }]} />
+          <View style={[styles.nowPlayingBar, { height: 14 }]} />
+          <View style={[styles.nowPlayingBar, { height: 10 }]} />
+          <View style={[styles.nowPlayingBar, { height: 6 }]} />
+        </View>
+      )}
+    </Pressable>
+  );
+
+  // Song context menu modal for long-press actions
+  const renderSongContextMenu = () => (
+    <Modal
+      visible={showSongMenu}
+      transparent={true}
+      animationType="fade"
+      onRequestClose={() => setShowSongMenu(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={styles.contextMenuContainer}>
+          <Text style={styles.contextMenuTitle}>{selectedMenuSong?.name}</Text>
+          
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedMenuSong && queue.length > 0) {
+                const currentIndex = queue.findIndex(s => s.id === currentSong?.id);
+                const newQueue = [...queue];
+                newQueue.splice(currentIndex + 1, 0, selectedMenuSong);
+                setQueue(newQueue);
+                setShowSongMenu(false);
+              }
+            }}
+          >
+            <FontAwesome name="play" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Play Next</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedMenuSong) {
+                const songWithId = ensureUniqueId({...selectedMenuSong});
+                setQueue([...queue, songWithId]);
+                setShowSongMenu(false);
+              }
+            }}
+          >
+            <FontAwesome name="plus" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Add to Queue</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedMenuSong) {
+                Share.share({
+                  message: `Check out ${selectedMenuSong.name} by ${selectedMenuSong.artist} on Ninaada Music!`,
+                  title: 'Share Song',
+                });
+                setShowSongMenu(false);
+              }
+            }}
+          >
+            <FontAwesome name="share" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Share</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedMenuSong) {
+                handleDownload(selectedMenuSong, setDownloadProgress, loadDownloadedSongs);
+                setShowSongMenu(false);
+              }
+            }}
+          >
+            <FontAwesome name="download" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Download</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.menuOption, styles.cancelButton]}
+            onPress={() => setShowSongMenu(false)}
+          >
+            <Text style={styles.cancelButtonText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  // Playlist selector modal
+  const renderPlaylistSelector = () => {
+    // Use selectedThreeDotSong if available (from 3-dot menu), otherwise currentSong
+    const songToAdd = selectedThreeDotSong || currentSong;
+    
+    // Show modal even if songToAdd is not ready, it will be set
+    if (!showPlaylistSelector) return null;
+
+    return (
+      <Modal
+        visible={showPlaylistSelector}
+        transparent={true}
+        animationType="slide"
+        onRequestClose={() => setShowPlaylistSelector(false)}
+      >
+        <View style={styles.modalContainer}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Select Playlist</Text>
+              <TouchableOpacity onPress={() => setShowPlaylistSelector(false)}>
+                <MaterialIcons name="close" size={28} color="#1DB954" />
+              </TouchableOpacity>
+            </View>
+            {/* Create new playlist inline */}
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
+              <TextInput
+                style={[styles.playlistInput, { flex: 1, marginRight: 8 }]}
+                placeholder="New playlist name"
+                value={newPlaylistName}
+                onChangeText={setNewPlaylistName}
+                placeholderTextColor="#999"
+              />
+              <TouchableOpacity
+                style={styles.createPlaylistButton}
+                onPress={async () => {
+                  if (!newPlaylistName.trim()) return;
+                  if (!songToAdd) return;
+                  const newId = Date.now().toString();
+                  const newPlaylist = { id: newId, name: newPlaylistName, songs: [ensureUniqueId(songToAdd)] };
+                  const updatedPlaylists = [...playlists, newPlaylist];
+                  setPlaylists(updatedPlaylists);
+                  setNewPlaylistName('');
+                  await AsyncStorage.setItem('playlists', JSON.stringify(updatedPlaylists));
+                  setShowPlaylistSelector(false);
+                  Alert.alert('Playlist Created', `Added to playlist '${newPlaylist.name}'`);
+                }}
+              >
+                <Text style={styles.createPlaylistButtonText}>Create & Add</Text>
+              </TouchableOpacity>
+            </View>
+            <FlatList
+              data={playlists}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={styles.playlistSelectItem}
+                  onPress={async () => {
+                    if (songToAdd) {
+                      await addToPlaylist(songToAdd, item.id);
+                      setTimeout(() => setShowPlaylistSelector(false), 300);
+                    }
+                  }}
+                >
+                  <MaterialIcons name="library-music" size={24} color="#1DB954" />
+                  <Text style={styles.playlistSelectName}>{item.name}</Text>
+                  <Text style={styles.playlistSelectCount}>({item.songs.length} songs)</Text>
+                </TouchableOpacity>
+              )}
+              keyExtractor={(item, index) => item._uniqueId || `${item.id}-${index}`}
+            />
+          </View>
+        </View>
+      </Modal>
+    );
+  };
+
+  // 3-dot menu modal for song actions
+  const renderThreeDotMenu = () => (
+    <Modal
+      visible={showThreeDotMenu}
+      transparent={true}
+      animationType="fade"
+      onRequestClose={() => setShowThreeDotMenu(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={styles.contextMenuContainer}>
+          <Text style={styles.contextMenuTitle}>{selectedThreeDotSong?.name}</Text>
+          
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedThreeDotSong && queue.length > 0) {
+                const currentIndex = queue.findIndex(s => s.id === currentSong?.id);
+                const newQueue = [...queue];
+                newQueue.splice(currentIndex + 1, 0, selectedThreeDotSong);
+                setQueue(newQueue);
+                setShowThreeDotMenu(false);
+              }
+            }}
+          >
+            <FontAwesome name="play" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Play Next</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedThreeDotSong) {
+                const songWithId = ensureUniqueId({...selectedThreeDotSong});
+                setQueue([...queue, songWithId]);
+                setShowThreeDotMenu(false);
+              }
+            }}
+          >
+            <FontAwesome name="plus" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Add to Queue</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedThreeDotSong) {
+                likeSong(selectedThreeDotSong);
+                setShowThreeDotMenu(false);
+              }
+            }}
+          >
+            <MaterialIcons
+              name={likedSongs.find(s => s.id === selectedThreeDotSong?.id) ? 'favorite' : 'favorite-border'}
+              size={20}
+              color="#666"
+            />
+            <Text style={styles.menuOptionText}>
+              {likedSongs.find(s => s.id === selectedThreeDotSong?.id) ? 'Unlike' : 'Like'}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              // Open playlist selector regardless of whether playlists exist
+              // User can create a playlist directly from the selector modal
+              setShowPlaylistSelector(true);
+              setTimeout(() => {
+                setShowThreeDotMenu(false);
+              }, 100);
+            }}
+          >
+            <MaterialIcons name="playlist-add" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Add to Playlist</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedThreeDotSong) {
+                Share.share({
+                  message: `Check out ${selectedThreeDotSong.name} by ${selectedThreeDotSong.artist} on Ninaada Music!`,
+                  title: 'Share Song',
+                });
+                setShowThreeDotMenu(false);
+              }
+            }}
+          >
+            <FontAwesome name="share" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Share</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedThreeDotSong) {
+                handleDownload(selectedThreeDotSong, setDownloadProgress, loadDownloadedSongs);
+                setShowThreeDotMenu(false);
+              }
+            }}
+          >
+            <FontAwesome name="download" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Download</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.menuOption}
+            onPress={() => {
+              if (selectedThreeDotSong) {
+                removeFromRecentlyPlayed(selectedThreeDotSong.id);
+                setShowThreeDotMenu(false);
+              }
+            }}
+          >
+            <MaterialIcons name="history" size={20} color="#666" />
+            <Text style={styles.menuOptionText}>Remove from Recently Played</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.menuOption, styles.cancelButton]}
+            onPress={() => setShowThreeDotMenu(false)}
+          >
+            <Text style={styles.cancelButtonText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  // Home screen
+  if (activeTab === 'home') {
+    const getGreeting = () => {
+      const hour = new Date().getHours();
+      if (hour < 12) return 'Good Morning';
+      if (hour < 17) return 'Good Afternoon';
+      if (hour < 21) return 'Good Evening';
+      return 'Good Night';
+    };
+
+    return (
+      <View style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#0d0d0d" />
+        
+        {/* Header with gradient */}
+        <LinearGradient
+          colors={['#1DB954', '#0d0d0d']}
+          style={styles.headerGradient}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 0, y: 1 }}
+        >
+          <Text style={styles.greeting}>{getGreeting()} 🎶</Text>
+          <Text style={styles.title}>Ninaada Music</Text>
+          <Text style={styles.tagline}>Resonating Beyond Listening</Text>
+        </LinearGradient>
+        
+        {/* Search Bar */}
+        <View style={styles.searchContainer}>
+          <View style={styles.searchInputWrapper}>
+            <MaterialIcons name="search" size={22} color="#888" style={{ marginLeft: 12 }} />
+            <TextInput
+              style={styles.searchInput}
+              placeholder="What do you want to listen to?"
+              value={searchQuery}
+              onChangeText={setSearchQuery}
+              placeholderTextColor="#888"
+              onSubmitEditing={searchSongs}
+              returnKeyType="search"
+            />
+            {searchQuery.length > 0 && (
+              <TouchableOpacity onPress={() => { setSearchQuery(''); setSongs([]); }} style={{ paddingHorizontal: 10 }}>
+                <MaterialIcons name="close" size={22} color="#888" />
+              </TouchableOpacity>
+            )}
+          </View>
+          <TouchableOpacity style={styles.searchButton} onPress={searchSongs}>
+            <Ionicons name="search" size={22} color="#FFF" />
+          </TouchableOpacity>
+        </View>
+
+        {loading && (
+          <View style={styles.loadingContainer}>
+            <ActivityIndicator size="large" color="#1DB954" />
+            <Text style={styles.loadingText}>Finding your music...</Text>
+          </View>
+        )}
+
+        {/* Search Results */}
+        {songs.length > 0 && (
+          <>
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Search Results</Text>
+              <Text style={styles.sectionCount}>{songs.length} songs</Text>
+            </View>
+            <FlatList
+              data={songs}
+              renderItem={({ item }) => renderSongCard(item)}
+              keyExtractor={(item, index) => item._uniqueId || `${item.id}-${index}`}
+              numColumns={2}
+              columnWrapperStyle={styles.row}
+              contentContainerStyle={styles.listContent}
+              showsVerticalScrollIndicator={false}
+            />
+          </>
+        )}
+
+        {/* Recently Played */}
+        {songs.length === 0 && recentlyPlayed.length > 0 && (
+          <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 160 }}>
+            {/* Download progress banner */}
+            {downloadProgress && (
+              <View style={styles.downloadBanner}>
+                <ActivityIndicator size="small" color="#1DB954" />
+                <Text style={styles.downloadBannerText}>Downloading: {downloadProgress.song}</Text>
+              </View>
+            )}
+
+            {/* Sleep Timer indicator */}
+            {sleepTimerActive && (
+              <View style={styles.sleepTimerBanner}>
+                <Ionicons name="moon" size={16} color="#7B2FBE" />
+                <Text style={styles.sleepTimerBannerText}>
+                  {sleepTimerEndOfSong ? 'Stopping after current song' : `Sleep: ${formatTimerDisplay(sleepTimerRemaining)}`}
+                </Text>
+                <TouchableOpacity onPress={() => startSleepTimer(0)}>
+                  <Text style={{ color: '#FF5252', fontSize: 12, fontWeight: '600' }}>Cancel</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
+            {/* Recently Played Section */}
+            <View style={styles.sectionHeader}>
+              <Text style={styles.sectionTitle}>Recently Played</Text>
+              <TouchableOpacity onPress={() => {
+                Alert.alert('Clear History', 'Clear all recently played?', [
+                  { text: 'Cancel' },
+                  { text: 'Clear', onPress: async () => { setRecentlyPlayed([]); await AsyncStorage.removeItem('recentlyPlayed'); }}
+                ]);
+              }}>
+                <Text style={styles.sectionAction}>Clear All</Text>
+              </TouchableOpacity>
+            </View>
+            <FlatList
+              data={recentlyPlayed.slice(0, 6)}
+              renderItem={({ item }) => renderSongCard(item)}
+              keyExtractor={(item, index) => `rp-${item.id}-${index}`}
+              numColumns={2}
+              columnWrapperStyle={styles.row}
+              scrollEnabled={false}
+            />
+
+            {/* Most Played Section */}
+            {getMostPlayed().length > 0 && (
+              <>
+                <View style={[styles.sectionHeader, { marginTop: 16 }]}>
+                  <Text style={styles.sectionTitle}>Most Played</Text>
+                  <Text style={styles.sectionCount}>Top {Math.min(getMostPlayed().length, 10)}</Text>
+                </View>
+                <FlatList
+                  data={getMostPlayed().slice(0, 6)}
+                  renderItem={({ item }) => (
+                    <Pressable
+                      style={styles.songCard}
+                      onPress={() => playSong(item)}
+                      onLongPress={() => { setSelectedMenuSong(item); setShowSongMenu(true); }}
+                    >
+                      <View style={styles.songImageContainer}>
+                        <Image source={{ uri: item.image || 'https://via.placeholder.com/150' }} style={styles.songImage} />
+                        <View style={styles.playOverlay}>
+                          <View style={styles.playIconBg}>
+                            <Ionicons name="play" size={22} color="#FFF" />
+                          </View>
+                        </View>
+                        {/* Play count badge */}
+                        <View style={styles.playCountBadge}>
+                          <Ionicons name="play-circle" size={12} color="#FFF" />
+                          <Text style={styles.playCountBadgeText}>{item.playCount}x</Text>
+                        </View>
+                      </View>
+                      <View style={styles.songInfo}>
+                        <Text style={styles.songName} numberOfLines={1}>{item.name}</Text>
+                        <Text style={styles.artistName} numberOfLines={1}>{item.artist}</Text>
+                      </View>
+                    </Pressable>
+                  )}
+                  keyExtractor={(item, index) => `mp-${item.id}-${index}`}
+                  numColumns={2}
+                  columnWrapperStyle={styles.row}
+                  scrollEnabled={false}
+                />
+              </>
+            )}
+
+            {/* Quick Picks / For You */}
+            {quickPicks.length > 0 && (
+              <>
+                <View style={[styles.sectionHeader, { marginTop: 16 }]}>
+                  <Text style={styles.sectionTitle}>Quick Picks</Text>
+                  <TouchableOpacity onPress={() => { quickPicksFetched.current = false; fetchQuickPicks(); }}>
+                    <Text style={styles.sectionAction}>Refresh</Text>
+                  </TouchableOpacity>
+                </View>
+                <FlatList
+                  data={quickPicks.slice(0, 6)}
+                  renderItem={({ item }) => renderSongCard(item)}
+                  keyExtractor={(item, index) => `qp-${item.id}-${index}`}
+                  numColumns={2}
+                  columnWrapperStyle={styles.row}
+                  scrollEnabled={false}
+                />
+              </>
+            )}
+            {loadingQuickPicks && (
+              <View style={{ alignItems: 'center', paddingVertical: 12 }}>
+                <ActivityIndicator size="small" color="#1DB954" />
+                <Text style={{ color: '#888', fontSize: 12, marginTop: 4 }}>Loading suggestions...</Text>
+              </View>
+            )}
+
+            {/* Downloaded Songs shortcut */}
+            {downloadedSongs.length > 0 && (
+              <>
+                <View style={[styles.sectionHeader, { marginTop: 16 }]}>
+                  <Text style={styles.sectionTitle}>Downloaded</Text>
+                  <TouchableOpacity onPress={() => { setActiveTab('playlists'); setLibraryTab('downloads'); }}>
+                    <Text style={styles.sectionAction}>View All</Text>
+                  </TouchableOpacity>
+                </View>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ paddingLeft: 16, marginBottom: 8 }}>
+                  {downloadedSongs.slice(0, 8).map((item, index) => (
+                    <TouchableOpacity
+                      key={`dh-${item.id}-${index}`}
+                      style={styles.downloadChip}
+                      onPress={() => playSong(item, 'downloaded')}
+                    >
+                      <Image source={{ uri: item.image || 'https://via.placeholder.com/40' }} style={styles.downloadChipImage} />
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.downloadChipName} numberOfLines={1}>{item.name}</Text>
+                        <Text style={styles.downloadChipArtist} numberOfLines={1}>{item.artist}</Text>
+                      </View>
+                      <Ionicons name="cloud-done" size={14} color="#1DB954" />
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              </>
+            )}
+          </ScrollView>
+        )}
+
+        {/* Empty State */}
+        {songs.length === 0 && recentlyPlayed.length === 0 && !loading && (
+          <View style={styles.emptyStateContainer}>
+            <MaterialIcons name="music-note" size={80} color="#1DB954" />
+            <Text style={styles.emptyStateTitle}>Your Music Awaits</Text>
+            <Text style={styles.emptyStateSubtitle}>Search for your favorite songs, artists, or albums to start listening</Text>
+            <View style={styles.quickSearchContainer}>
+              <Text style={styles.quickSearchLabel}>Try searching:</Text>
+              <View style={styles.quickSearchTags}>
+                {['Arijit Singh', 'Anirudh', 'AP Dhillon', 'KK'].map((tag) => (
+                  <TouchableOpacity key={tag} style={styles.quickSearchTag} onPress={() => { setSearchQuery(tag); }}>
+                    <Text style={styles.quickSearchTagText}>{tag}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
+          </View>
+        )}
+
+        {/* Footer */}
+        <View style={styles.footerBar}>
+          <Text style={styles.footerBarText}>Crafted with ❤️ by Pramod B Belagali</Text>
+          <View style={styles.footerLinks}>
+            <TouchableOpacity onPress={() => Linking.openURL('https://instagram.com/pramod_belagali49')} style={styles.socialChip}>
+              <Ionicons name="logo-instagram" size={14} color="#1DB954" />
+              <Text style={styles.socialChipText}>Instagram</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => Linking.openURL('https://www.linkedin.com/in/pramodbelagali49')} style={styles.socialChip}>
+              <Ionicons name="logo-linkedin" size={14} color="#1DB954" />
+              <Text style={styles.socialChipText}>LinkedIn</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        {/* Mini Player */}
+        {renderMiniPlayer()}
+
+        {/* Bottom Navigation */}
+        {renderBottomNav()}
+        {renderSongContextMenu()}
+        {renderThreeDotMenu()}
+      </View>
+    );
+  }
+
+  // Player screen
+  if (activeTab === 'player') {
+    return (
+      <View style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#0d0d0d" />
+        {currentSong ? (
+          <ScrollView contentContainerStyle={styles.playerContent} showsVerticalScrollIndicator={false}>
+            {/* Back button and title */}
+            <View style={styles.playerTopBar}>
+              <TouchableOpacity onPress={() => { setNavigationStack(['home']); setActiveTab('home'); }}>
+                <Ionicons name="chevron-down" size={28} color="#FFF" />
+              </TouchableOpacity>
+              <Text style={styles.playerTopTitle}>Now Playing</Text>
+              <TouchableOpacity onPress={() => { setSelectedThreeDotSong(currentSong); setShowThreeDotMenu(true); }}>
+                <Ionicons name="ellipsis-horizontal" size={24} color="#FFF" />
+              </TouchableOpacity>
+            </View>
+
+            {/* Album Art with shadow */}
+            <View style={styles.albumArtContainer}>
+              <Image
+                source={{ uri: currentSong.image || 'https://via.placeholder.com/300' }}
+                style={styles.albumArt}
+              />
+            </View>
+
+            {/* Song Info */}
+            <View style={styles.playerSongInfoContainer}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.playerSongName} numberOfLines={1}>{currentSong.name}</Text>
+                <Text style={styles.playerArtist} numberOfLines={1}>{currentSong.artist}</Text>
+              </View>
+              <TouchableOpacity onPress={() => likeSong(currentSong)}>
+                <Ionicons
+                  name={likedSongs.find(s => s.id === currentSong.id) ? 'heart' : 'heart-outline'}
+                  size={28}
+                  color={likedSongs.find(s => s.id === currentSong.id) ? '#FF4D6D' : '#888'}
+                />
+              </TouchableOpacity>
+            </View>
+            
+            {/* Auto-play toggle */}
+            <View style={styles.autoPlayRow}>
+              <Ionicons name="radio-outline" size={18} color={autoPlaySimilar ? '#1DB954' : '#888'} />
+              <Text style={styles.autoPlayText}>Auto-play similar</Text>
+              <TouchableOpacity
+                onPress={async () => {
+                  const newValue = !autoPlaySimilar;
+                  setAutoPlaySimilar(newValue);
+                  if (newValue && currentSong) {
+                    try {
+                      const res = await fetch(`${API_BASE}/song/similar/?id=${currentSong.id}`);
+                      const data = await res.json();
+                      if (data && data.length > 0) {
+                        const similarSongs = data.slice(0, 6).map(nextSong => ({
+                          id: nextSong.id,
+                          name: nextSong.song || nextSong.name || 'Unknown',
+                          artist: nextSong.primary_artists || nextSong.artist || 'Unknown Artist',
+                          image: nextSong.image || 'https://via.placeholder.com/150',
+                          duration: nextSong.duration || 240,
+                          media_url: nextSong.media_url || '',
+                          ...nextSong
+                        }));
+                        setQueue(prevQueue => [...(prevQueue || []), ...similarSongs]);
+                      }
+                    } catch (e) {
+                      console.log('Error fetching similar songs for auto-play:', e);
+                    }
+                  }
+                }}
+                style={[styles.toggleSwitch, autoPlaySimilar && styles.toggleSwitchActive]}
+                activeOpacity={0.8}
+              >
+                <View style={[styles.toggleThumb, autoPlaySimilar && styles.toggleThumbActive]} />
+              </TouchableOpacity>
+            </View>
+
+            {/* Progress bar - Draggable Seek */}
+            <View style={styles.progressContainer}>
+              <Pressable
+                style={styles.seekTapArea}
+                onPress={(e) => {
+                  const touchX = e.nativeEvent.locationX;
+                  const trackWidth = Dimensions.get('window').width - 48;
+                  handleSeekTap(touchX, trackWidth);
+                }}
+                onStartShouldSetResponder={() => true}
+                onMoveShouldSetResponder={() => true}
+                onResponderMove={(e) => {
+                  const touchX = e.nativeEvent.locationX;
+                  const trackWidth = Dimensions.get('window').width - 48;
+                  handleSeekDrag(touchX, trackWidth);
+                }}
+                onResponderGrant={() => handleSeekDragStart()}
+                onResponderRelease={() => handleSeekDragEnd()}
+              >
+                <View style={styles.seekTrackBg} />
+                <View
+                  style={[styles.seekTrackFill, { width: `${duration > 0 ? ((isDraggingSeek ? seekingPosition : progress) / duration) * 100 : 0}%` }]}
+                />
+                <View
+                  style={[styles.seekThumb, { left: `${duration > 0 ? ((isDraggingSeek ? seekingPosition : progress) / duration) * 100 : 0}%` }]}
+                />
+              </Pressable>
+              <View style={styles.timeRow}>
+                <Text style={styles.timeText}>{isDraggingSeek ? formatTime(seekingPosition) : currentTime}</Text>
+                <Text style={styles.timeText}>{songDuration}</Text>
+              </View>
+            </View>
+
+            {/* Controls */}
+            <View style={styles.controls}>
+              <TouchableOpacity onPress={toggleShuffle} style={styles.controlBtn}>
+                <Ionicons name="shuffle" size={24} color={shuffle ? '#1DB954' : '#888'} />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={playPrevious} style={styles.controlBtn}>
+                <Ionicons name="play-skip-back" size={30} color="#FFF" />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={async () => {
+                if (soundRef.current) {
+                  if (isPlaying) { await soundRef.current.pauseAsync(); } else { await soundRef.current.playAsync(); }
+                  setIsPlaying(!isPlaying);
+                }
+              }} style={styles.playPauseBtn}>
+                <LinearGradient colors={['#1DB954', '#1ed760']} style={styles.playPauseBtnGradient}>
+                  <Ionicons name={isPlaying ? 'pause' : 'play'} size={32} color="#FFF" />
+                </LinearGradient>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={playNext} style={styles.controlBtn}>
+                <Ionicons name="play-skip-forward" size={30} color="#FFF" />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={toggleRepeat} style={styles.controlBtn}>
+                <Ionicons
+                  name={repeat === 'one' ? 'repeat' : 'repeat'}
+                  size={24}
+                  color={repeat === 'off' ? '#888' : '#1DB954'}
+                />
+                {repeat === 'one' && <View style={styles.repeatOneDot} />}
+              </TouchableOpacity>
+            </View>
+
+            {/* Action Buttons Row 1 */}
+            <View style={styles.actionButtonsRow}>
+              <TouchableOpacity style={styles.actionBtn} onPress={() => setShowQueue(true)}>
+                <Ionicons name="list" size={20} color="#1DB954" />
+                <Text style={styles.actionBtnText}>Queue</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.actionBtn} onPress={() => fetchLyrics(currentSong)}>
+                <Ionicons name="document-text-outline" size={20} color="#1DB954" />
+                <Text style={styles.actionBtnText}>Lyrics</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.actionBtn} onPress={() => setShowPlaylistSelector(true)}>
+                <Ionicons name="add-circle-outline" size={20} color="#1DB954" />
+                <Text style={styles.actionBtnText}>Add to List</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.actionBtn} onPress={() => Share.share({ message: `Check out ${currentSong.name} by ${currentSong.artist} on Ninaada Music!` })}>
+                <Ionicons name="share-social-outline" size={20} color="#1DB954" />
+                <Text style={styles.actionBtnText}>Share</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Action Buttons Row 2 — New Features */}
+            <View style={[styles.actionButtonsRow, { marginTop: 12 }]}>
+              <TouchableOpacity style={styles.actionBtn} onPress={() => setShowSleepTimerModal(true)}>
+                <Ionicons name="moon-outline" size={20} color={sleepTimerActive ? '#7B2FBE' : '#1DB954'} />
+                <Text style={[styles.actionBtnText, sleepTimerActive && { color: '#7B2FBE' }]}>
+                  {sleepTimerActive ? (sleepTimerEndOfSong ? 'End Song' : formatTimerDisplay(sleepTimerRemaining)) : 'Timer'}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.actionBtn} onPress={() => setShowSpeedModal(true)}>
+                <Ionicons name="speedometer-outline" size={20} color={playbackSpeed !== 1.0 ? '#FF6B35' : '#1DB954'} />
+                <Text style={[styles.actionBtnText, playbackSpeed !== 1.0 && { color: '#FF6B35' }]}>{playbackSpeed}x</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.actionBtn} onPress={() => { if (currentSong) handleDownload(currentSong, setDownloadProgress, loadDownloadedSongs); }}>
+                <Ionicons name={downloadedSongs.find(s => s.id === currentSong?.id) ? 'cloud-done' : 'download-outline'} size={20} color={downloadedSongs.find(s => s.id === currentSong?.id) ? '#1DB954' : '#1DB954'} />
+                <Text style={styles.actionBtnText}>{downloadedSongs.find(s => s.id === currentSong?.id) ? 'Saved' : 'Download'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.actionBtn} onPress={() => { if (currentSong) likeSong(currentSong); }}>
+                <Ionicons name={likedSongs.find(s => s.id === currentSong?.id) ? 'heart' : 'heart-outline'} size={20} color={likedSongs.find(s => s.id === currentSong?.id) ? '#FF4D6D' : '#1DB954'} />
+                <Text style={styles.actionBtnText}>{likedSongs.find(s => s.id === currentSong?.id) ? 'Liked' : 'Like'}</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Play count display */}
+            {playCounts[currentSong?.id] && (
+              <View style={{ alignItems: 'center', marginTop: 12 }}>
+                <Text style={{ color: '#555', fontSize: 11 }}>Played {playCounts[currentSong.id].count} time{playCounts[currentSong.id].count !== 1 ? 's' : ''}</Text>
+              </View>
+            )}
+
+            {/* Sleep Timer active indicator */}
+            {sleepTimerActive && (
+              <View style={[styles.sleepTimerBanner, { marginTop: 12, marginHorizontal: 0 }]}>
+                <Ionicons name="moon" size={14} color="#7B2FBE" />
+                <Text style={styles.sleepTimerBannerText}>
+                  {sleepTimerEndOfSong ? 'Stopping after this song' : `Sleep in ${formatTimerDisplay(sleepTimerRemaining)}`}
+                </Text>
+                <TouchableOpacity onPress={() => startSleepTimer(0)}>
+                  <Text style={{ color: '#FF5252', fontSize: 12, fontWeight: '600' }}>Cancel</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
+          </ScrollView>
+        ) : (
+          <View style={styles.emptyStateContainer}>
+            <Ionicons name="musical-notes" size={80} color="#333" />
+            <Text style={styles.emptyStateTitle}>Nothing Playing</Text>
+            <Text style={styles.emptyStateSubtitle}>Search and play a song to see the player</Text>
+          </View>
+        )}
+
+        {/* Queue Modal */}
+        <Modal
+          visible={showQueue}
+          transparent={true}
+          animationType="slide"
+          onRequestClose={() => setShowQueue(false)}
+        >
+          <View style={styles.modalContainer}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>Queue ({queue.length} songs)</Text>
+                <TouchableOpacity onPress={() => setShowQueue(false)}>
+                  <MaterialIcons name="close" size={28} color="#1DB954" />
+                </TouchableOpacity>
+              </View>
+
+              <FlatList
+                data={queue}
+                keyExtractor={(item, index) => item._uniqueId || `${item.id}-${index}`}
+                renderItem={({ item, index }) => (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderColor: '#eee' }}>
+                    <TouchableOpacity
+                      onPress={() => {
+                        setShowQueue(false);
+                        playSong(item, queueContext);
+                      }}
+                      style={{ flex: 1, flexDirection: 'row', alignItems: 'center' }}
+                    >
+                      <Image source={{ uri: item.image || 'https://via.placeholder.com/40' }} style={{ width: 40, height: 40, borderRadius: 4, marginRight: 12 }} />
+                      <View style={{ flex: 1 }}>
+                        <Text numberOfLines={1} style={{ fontWeight: '600', color: '#FFF' }}>{item.name}</Text>
+                        <Text numberOfLines={1} style={{ color: '#CCCCCC', fontSize: 13 }}>{item.artist}</Text>
+                      </View>
+                      {currentSong && item.id === currentSong.id && (
+                        <MaterialIcons name="play-arrow" size={24} color="#1DB954" style={{ marginLeft: 8 }} />
+                      )}
+                    </TouchableOpacity>
+                    {/* Remove button */}
+                    <TouchableOpacity onPress={() => removeQueueItem(index)} style={{ marginLeft: 8 }}>
+                      <MaterialIcons name="delete" size={22} color="#FF5252" />
+                    </TouchableOpacity>
+                    {/* Drag up/down buttons */}
+                    <TouchableOpacity onPress={() => moveQueueItemUp(index)} disabled={index === 0} style={{ marginLeft: 4, opacity: index === 0 ? 0.3 : 1 }}>
+                      <MaterialIcons name="arrow-upward" size={22} color="#888" />
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => moveQueueItemDown(index)} disabled={index === queue.length - 1} style={{ marginLeft: 2, opacity: index === queue.length - 1 ? 0.3 : 1 }}>
+                      <MaterialIcons name="arrow-downward" size={22} color="#888" />
+                    </TouchableOpacity>
+                  </View>
+                )}
+                ListEmptyComponent={<Text style={{ textAlign: 'center', color: '#888', marginVertical: 16 }}>Queue is empty</Text>}
+                style={{ maxHeight: 320 }}
+              />
+            </View>
+          </View>
+        </Modal>
+
+        {/* Lyrics Modal */}
+        <Modal
+          visible={showLyrics}
+          transparent={true}
+          animationType="slide"
+          onRequestClose={() => setShowLyrics(false)}
+        >
+          <View style={styles.modalContainer}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeader}>
+                <Text style={styles.modalTitle}>📝 Lyrics</Text>
+                <TouchableOpacity onPress={() => setShowLyrics(false)}>
+                  <MaterialIcons name="close" size={28} color="#1DB954" />
+                </TouchableOpacity>
+              </View>
+              <ScrollView style={styles.lyricsContent}>
+                <Text style={styles.lyricsSongName}>{currentSong?.name}</Text>
+                <Text style={styles.lyricsArtist}>{currentSong?.artist}</Text>
+                
+                {lyricsLines.length > 0 ? (
+                  <View>
+                    {lyricsLines.map((line, index) => (
+                      <Text
+                        key={index}
+                        style={[
+                          styles.lyricsLineText,
+                          index === currentLyricIndex && styles.lyricsCurrentLine,
+                        ]}
+                      >
+                        {line}
+                      </Text>
+                    ))}
+                  </View>
+                ) : (
+                  <Text style={styles.lyricsText}>{lyrics}</Text>
+                )}
+              </ScrollView>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Sleep Timer Modal */}
+        <Modal
+          visible={showSleepTimerModal}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setShowSleepTimerModal(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.contextMenuContainer}>
+              <Text style={styles.contextMenuTitle}>Sleep Timer</Text>
+              <Text style={{ color: '#888', textAlign: 'center', marginBottom: 16, fontSize: 13 }}>
+                Automatically stop playback
+              </Text>
+              {[5, 10, 15, 30, 45, 60].map(min => (
+                <TouchableOpacity
+                  key={min}
+                  style={[styles.menuOption, sleepTimerMinutes === min && sleepTimerActive && { backgroundColor: 'rgba(123,47,190,0.15)' }]}
+                  onPress={() => startSleepTimer(min)}
+                >
+                  <Ionicons name="time-outline" size={20} color={sleepTimerMinutes === min && sleepTimerActive ? '#7B2FBE' : '#666'} />
+                  <Text style={styles.menuOptionText}>{min} minutes</Text>
+                  {sleepTimerMinutes === min && sleepTimerActive && (
+                    <Ionicons name="checkmark-circle" size={20} color="#7B2FBE" />
+                  )}
+                </TouchableOpacity>
+              ))}
+              <TouchableOpacity
+                style={[styles.menuOption, sleepTimerEndOfSong && { backgroundColor: 'rgba(123,47,190,0.15)' }]}
+                onPress={() => startSleepTimer(-1)}
+              >
+                <Ionicons name="musical-note" size={20} color={sleepTimerEndOfSong ? '#7B2FBE' : '#666'} />
+                <Text style={styles.menuOptionText}>End of current song</Text>
+                {sleepTimerEndOfSong && <Ionicons name="checkmark-circle" size={20} color="#7B2FBE" />}
+              </TouchableOpacity>
+              {sleepTimerActive && (
+                <TouchableOpacity
+                  style={[styles.menuOption, { backgroundColor: 'rgba(255,82,82,0.1)' }]}
+                  onPress={() => { startSleepTimer(0); setShowSleepTimerModal(false); }}
+                >
+                  <Ionicons name="close-circle" size={20} color="#FF5252" />
+                  <Text style={[styles.menuOptionText, { color: '#FF5252' }]}>Cancel Timer</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                style={[styles.menuOption, styles.cancelButton]}
+                onPress={() => setShowSleepTimerModal(false)}
+              >
+                <Text style={styles.cancelButtonText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Playback Speed Modal */}
+        <Modal
+          visible={showSpeedModal}
+          transparent={true}
+          animationType="fade"
+          onRequestClose={() => setShowSpeedModal(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.contextMenuContainer}>
+              <Text style={styles.contextMenuTitle}>Playback Speed</Text>
+              <View style={styles.speedGrid}>
+                {[0.5, 0.75, 1.0, 1.25, 1.5, 2.0].map(speed => (
+                  <TouchableOpacity
+                    key={speed}
+                    style={[styles.speedBtn, playbackSpeed === speed && styles.speedBtnActive]}
+                    onPress={() => changePlaybackSpeed(speed)}
+                  >
+                    <Text style={[styles.speedBtnText, playbackSpeed === speed && styles.speedBtnTextActive]}>
+                      {speed}x
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <TouchableOpacity
+                style={[styles.menuOption, styles.cancelButton, { marginTop: 12 }]}
+                onPress={() => setShowSpeedModal(false)}
+              >
+                <Text style={styles.cancelButtonText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
+        {renderPlaylistSelector()}
+        {renderThreeDotMenu()}
+        {renderBottomNav()}
+      </View>
+    );
+  }
+
+  // Liked songs screen
+  if (activeTab === 'liked') {
+    return (
+      <View style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#0d0d0d" />
+        <LinearGradient colors={['#FF4D6D', '#0d0d0d']} style={styles.headerGradient} start={{ x: 0, y: 0 }} end={{ x: 0, y: 1 }}>
+          <View style={styles.likedHeaderRow}>
+            <Ionicons name="heart" size={32} color="#FFF" />
+            <View style={{ marginLeft: 12 }}>
+              <Text style={styles.title}>Your Favorites</Text>
+              <Text style={styles.tagline}>{likedSongs.length} songs</Text>
+            </View>
+          </View>
+        </LinearGradient>
+
+        {likedSongs.length > 0 && (
+          <TouchableOpacity
+            style={styles.playAllButton}
+            onPress={() => { if (likedSongs.length > 0) playSong(likedSongs[0], 'liked'); }}
+          >
+            <LinearGradient colors={['#1DB954', '#1ed760']} style={styles.playAllGradient}>
+              <Ionicons name="play" size={20} color="#FFF" />
+              <Text style={styles.playAllText}>Play All</Text>
+            </LinearGradient>
+          </TouchableOpacity>
+        )}
+        
+        <FlatList
+          data={likedSongs}
+          renderItem={({ item }) => renderSongCard(item, 'liked')}
+          keyExtractor={(item, index) => item._uniqueId || `${item.id}-${index}`}
+          numColumns={2}
+          columnWrapperStyle={styles.row}
+          contentContainerStyle={styles.listContent}
+          showsVerticalScrollIndicator={false}
+        />
+
+        {likedSongs.length === 0 && (
+          <View style={styles.emptyStateContainer}>
+            <Ionicons name="heart-outline" size={80} color="#333" />
+            <Text style={styles.emptyStateTitle}>No Favorites Yet</Text>
+            <Text style={styles.emptyStateSubtitle}>Tap the heart icon on any song to add it here</Text>
+          </View>
+        )}
+
+        {renderMiniPlayer()}
+        {renderBottomNav()}
+        {renderThreeDotMenu()}
+      </View>
+    );
+  }
+
+  // Playlists / Library screen
+  if (activeTab === 'playlists') {
+    return (
+      <View style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#0d0d0d" />
+        <LinearGradient colors={['#7B2FBE', '#0d0d0d']} style={styles.headerGradient} start={{ x: 0, y: 0 }} end={{ x: 0, y: 1 }}>
+          <View style={styles.likedHeaderRow}>
+            <Ionicons name="library" size={32} color="#FFF" />
+            <View style={{ marginLeft: 12 }}>
+              <Text style={styles.title}>Your Library</Text>
+              <Text style={styles.tagline}>{playlists.length} playlists · {downloadedSongs.length} downloads</Text>
+            </View>
+          </View>
+        </LinearGradient>
+        
+        {/* Library Sub-tabs */}
+        <View style={styles.libraryTabBar}>
+          <TouchableOpacity
+            style={[styles.libraryTabBtn, libraryTab === 'playlists' && styles.libraryTabBtnActive]}
+            onPress={() => setLibraryTab('playlists')}
+          >
+            <Ionicons name="musical-notes" size={16} color={libraryTab === 'playlists' ? '#FFF' : '#888'} />
+            <Text style={[styles.libraryTabText, libraryTab === 'playlists' && styles.libraryTabTextActive]}>Playlists</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.libraryTabBtn, libraryTab === 'downloads' && styles.libraryTabBtnActive]}
+            onPress={() => setLibraryTab('downloads')}
+          >
+            <Ionicons name="download" size={16} color={libraryTab === 'downloads' ? '#FFF' : '#888'} />
+            <Text style={[styles.libraryTabText, libraryTab === 'downloads' && styles.libraryTabTextActive]}>Downloads</Text>
+            {downloadedSongs.length > 0 && (
+              <View style={styles.libraryBadge}>
+                <Text style={styles.libraryBadgeText}>{downloadedSongs.length}</Text>
+              </View>
+            )}
+          </TouchableOpacity>
+        </View>
+
+        {/* === DOWNLOADS TAB === */}
+        {libraryTab === 'downloads' && (
+          <>
+            {downloadProgress && (
+              <View style={styles.downloadBanner}>
+                <ActivityIndicator size="small" color="#1DB954" />
+                <Text style={styles.downloadBannerText}>Downloading: {downloadProgress.song}</Text>
+              </View>
+            )}
+            
+            {downloadedSongs.length > 0 && (
+              <TouchableOpacity
+                style={styles.playAllButton}
+                onPress={() => {
+                  setQueue(downloadedSongs);
+                  playSong(downloadedSongs[0], 'downloaded');
+                }}
+              >
+                <LinearGradient colors={['#1DB954', '#1ed760']} style={styles.playAllGradient}>
+                  <Ionicons name="play" size={20} color="#FFF" />
+                  <Text style={styles.playAllText}>Play All Downloads</Text>
+                </LinearGradient>
+              </TouchableOpacity>
+            )}
+
+            <FlatList
+              data={downloadedSongs}
+              renderItem={({ item, index }) => (
+                <View style={styles.downloadItem}>
+                  <TouchableOpacity
+                    onPress={() => {
+                      setQueue(downloadedSongs);
+                      playSong(item, 'downloaded');
+                    }}
+                    style={{ flex: 1, flexDirection: 'row', alignItems: 'center' }}
+                  >
+                    <Text style={styles.songIndex}>{index + 1}</Text>
+                    <Image
+                      source={{ uri: item.image || 'https://via.placeholder.com/50' }}
+                      style={styles.downloadItemImage}
+                    />
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.downloadItemName} numberOfLines={1}>{item.name}</Text>
+                      <Text style={styles.downloadItemArtist} numberOfLines={1}>{item.artist}</Text>
+                      <Text style={styles.downloadItemMeta}>
+                        {item.downloadedAt ? new Date(item.downloadedAt).toLocaleDateString() : ''} · {formatTime(parseInt(item.duration || 0))}
+                      </Text>
+                    </View>
+                    {currentSong && currentSong.id === item.id && (
+                      <MaterialIcons name="equalizer" size={22} color="#1DB954" style={{ marginRight: 8 }} />
+                    )}
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={() => {
+                      Alert.alert('Remove Download', `Remove "${item.name}" from downloads?`, [
+                        { text: 'Cancel' },
+                        { text: 'Remove', style: 'destructive', onPress: () => deleteDownloadedSong(item.id) }
+                      ]);
+                    }}
+                    style={styles.downloadDeleteBtn}
+                  >
+                    <MaterialIcons name="delete-outline" size={22} color="#FF5252" />
+                  </TouchableOpacity>
+                </View>
+              )}
+              keyExtractor={(item, index) => `dl-${item.id}-${index}`}
+              contentContainerStyle={styles.playlistsListContent}
+              showsVerticalScrollIndicator={false}
+              ListEmptyComponent={
+                <View style={styles.emptyStateContainer}>
+                  <Ionicons name="download-outline" size={80} color="#333" />
+                  <Text style={styles.emptyStateTitle}>No Downloads Yet</Text>
+                  <Text style={styles.emptyStateSubtitle}>Download songs using the 3-dot menu or long-press on a song</Text>
+                </View>
+              }
+            />
+          </>
+        )}
+
+        {/* === PLAYLISTS TAB === */}
+        {libraryTab === 'playlists' && !selectedPlaylist && (
+          <>
+            <View style={styles.playlistCreateContainer}>
+              <TextInput
+                style={styles.playlistInput}
+                placeholder="Create new playlist..."
+                value={newPlaylistName}
+                onChangeText={setNewPlaylistName}
+                placeholderTextColor="#666"
+                onSubmitEditing={createPlaylist}
+              />
+              <TouchableOpacity style={styles.createPlaylistButton} onPress={createPlaylist}>
+                <Ionicons name="add" size={24} color="#FFF" />
+              </TouchableOpacity>
+            </View>
+
+            <FlatList
+              data={playlists}
+              renderItem={({ item }) => (
+                <TouchableOpacity
+                  style={styles.playlistCard}
+                  onPress={() => setSelectedPlaylist(item)}
+                  activeOpacity={0.7}
+                >
+                  <LinearGradient
+                    colors={['#1DB954', '#148a3c']}
+                    style={styles.playlistIconBg}
+                  >
+                    <Ionicons name="musical-notes" size={24} color="#FFF" />
+                  </LinearGradient>
+                  <View style={styles.playlistInfo}>
+                    <Text style={styles.playlistName}>{item.name}</Text>
+                    <Text style={styles.playlistSongCount}>
+                      {(item.songs || []).length} songs
+                    </Text>
+                  </View>
+                  <Ionicons name="chevron-forward" size={22} color="#666" />
+                </TouchableOpacity>
+              )}
+              keyExtractor={(item, index) => item._uniqueId || `${item.id}-${index}`}
+              contentContainerStyle={styles.playlistsListContent}
+              showsVerticalScrollIndicator={false}
+            />
+
+            {playlists.length === 0 && (
+              <View style={styles.emptyStateContainer}>
+                <Ionicons name="library-outline" size={80} color="#333" />
+                <Text style={styles.emptyStateTitle}>No Playlists Yet</Text>
+                <Text style={styles.emptyStateSubtitle}>Create a playlist to organize your favorite music</Text>
+              </View>
+            )}
+          </>
+        )}
+
+        {/* === PLAYLIST DETAIL VIEW === */}
+        {libraryTab === 'playlists' && selectedPlaylist && (
+          <>
+            <View style={styles.playlistDetailHeader}>
+              <TouchableOpacity onPress={() => setSelectedPlaylist(null)} style={styles.backBtn}>
+                <Ionicons name="chevron-back" size={26} color="#FFF" />
+              </TouchableOpacity>
+              
+              {editingPlaylistId === selectedPlaylist.id ? (
+                <TextInput
+                  style={styles.playlistNameInput}
+                  value={editingPlaylistName}
+                  onChangeText={setEditingPlaylistName}
+                  placeholder="Playlist name"
+                  placeholderTextColor="#999"
+                  autoFocus
+                  onBlur={() => {
+                    if (editingPlaylistName.trim()) {
+                      updatePlaylistName(selectedPlaylist.id, editingPlaylistName);
+                    }
+                    setEditingPlaylistId(null);
+                  }}
+                />
+              ) : (
+                <TouchableOpacity
+                  style={styles.playlistNameEdit}
+                  onPress={() => {
+                    setEditingPlaylistId(selectedPlaylist.id);
+                    setEditingPlaylistName(selectedPlaylist.name);
+                  }}
+                >
+                  <Text style={styles.playlistDetailTitle}>{selectedPlaylist.name}</Text>
+                  <Ionicons name="pencil" size={16} color="#1DB954" style={{ marginLeft: 8 }} />
+                </TouchableOpacity>
+              )}
+              
+              <TouchableOpacity onPress={() => deletePlaylist(selectedPlaylist.id)} style={styles.deleteBtn}>
+                <Ionicons name="trash-outline" size={22} color="#FF4D6D" />
+              </TouchableOpacity>
+            </View>
+
+            {selectedPlaylist.songs && selectedPlaylist.songs.length > 0 && (
+              <TouchableOpacity
+                style={styles.playAllButton}
+                onPress={() => playSong(selectedPlaylist.songs[0], `playlist-${selectedPlaylist.id}`)}
+              >
+                <LinearGradient colors={['#1DB954', '#1ed760']} style={styles.playAllGradient}>
+                  <Ionicons name="play" size={20} color="#FFF" />
+                  <Text style={styles.playAllText}>Play All</Text>
+                </LinearGradient>
+              </TouchableOpacity>
+            )}
+
+            <FlatList
+              data={selectedPlaylist.songs || []}
+              renderItem={({ item, index }) => (
+                <TouchableOpacity
+                  style={styles.playlistSongItem}
+                  onPress={() => playSong(item, `playlist-${selectedPlaylist.id}`)}
+                >
+                  <Text style={styles.songIndex}>{index + 1}</Text>
+                  <Image
+                    source={{ uri: item.image || 'https://via.placeholder.com/50' }}
+                    style={styles.playlistSongImage}
+                  />
+                  <View style={styles.playlistSongDetails}>
+                    <Text style={styles.playlistSongName} numberOfLines={1}>{item.name}</Text>
+                    <Text style={styles.playlistSongArtist} numberOfLines={1}>{item.artist}</Text>
+                  </View>
+                  <TouchableOpacity
+                    onPress={() => removeFromPlaylist(item.id, selectedPlaylist.id)}
+                    style={styles.playlistRemoveButton}
+                  >
+                    <MaterialIcons name="close" size={20} color="#FF6B6B" />
+                  </TouchableOpacity>
+                </TouchableOpacity>
+              )}
+              keyExtractor={(item, index) => item._uniqueId || `${item.id}-${index}`}
+            />
+
+            {(!selectedPlaylist.songs || selectedPlaylist.songs.length === 0) && (
+              <View style={styles.emptyStateContainer}>
+                <Ionicons name="musical-note-outline" size={60} color="#333" />
+                <Text style={styles.emptyStateTitle}>Empty Playlist</Text>
+                <Text style={styles.emptyStateSubtitle}>Add songs from search or use the 3-dot menu</Text>
+              </View>
+            )}
+          </>
+        )}
+
+        {renderMiniPlayer()}
+        {renderBottomNav()}
+        {renderThreeDotMenu()}
+      </View>
+    );
+  }
+}
+
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0d0d0d',
+    paddingBottom: 70,
+  },
+  headerGradient: {
+    paddingTop: Platform.OS === 'android' ? 40 : 50,
+    paddingBottom: 20,
+    paddingHorizontal: 16,
+  },
+  greeting: {
+    fontSize: 14,
+    color: 'rgba(255,255,255,0.8)',
+    fontWeight: '500',
+    marginBottom: 4,
+  },
+  title: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: '#FFF',
+    letterSpacing: -0.5,
+  },
+  tagline: {
+    fontSize: 13,
+    color: 'rgba(255,255,255,0.6)',
+    marginTop: 2,
+  },
+  searchContainer: {
+    flexDirection: 'row',
+    marginHorizontal: 16,
+    marginBottom: 16,
+    gap: 10,
+  },
+  searchInputWrapper: {
+    flex: 1,
+    height: 48,
+    backgroundColor: '#1a1a2e',
+    borderRadius: 24,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  searchInput: {
+    flex: 1,
+    height: 48,
+    paddingHorizontal: 10,
+    color: '#FFF',
+    fontSize: 15,
+  },
+  searchButton: {
+    width: 48,
+    height: 48,
+    backgroundColor: '#1DB954',
+    borderRadius: 24,
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 4,
+  },
+  loadingContainer: {
+    paddingVertical: 40,
+    alignItems: 'center',
+  },
+  loadingText: {
+    color: '#888',
+    marginTop: 12,
+    fontSize: 14,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginHorizontal: 16,
+    marginBottom: 12,
+  },
+  sectionTitle: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#FFF',
+  },
+  sectionCount: {
+    fontSize: 13,
+    color: '#888',
+  },
+  sectionAction: {
+    fontSize: 13,
+    color: '#1DB954',
+    fontWeight: '600',
+  },
+  row: {
+    justifyContent: 'space-between',
+    marginHorizontal: 16,
+    marginBottom: 12,
+    gap: 10,
+  },
+  listContent: {
+    paddingBottom: 80,
+  },
+  songCard: {
+    flex: 1,
+    backgroundColor: '#161622',
+    borderRadius: 14,
+    overflow: 'hidden',
+    elevation: 3,
+  },
+  songImageContainer: {
+    position: 'relative',
+  },
+  songImage: {
+    width: '100%',
+    height: 160,
+    borderTopLeftRadius: 14,
+    borderTopRightRadius: 14,
+  },
+  playOverlay: {
+    position: 'absolute',
+    bottom: 8,
+    right: 8,
+  },
+  playIconBg: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#1DB954',
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 4,
+  },
+  likeButton: {
+    position: 'absolute',
+    top: 8,
+    left: 8,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    padding: 6,
+    borderRadius: 14,
+  },
+  threeDotsButton: {
+    position: 'absolute',
+    right: 8,
+    top: 8,
+    padding: 6,
+    zIndex: 10,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    borderRadius: 14,
+  },
+  durationBadge: {
+    position: 'absolute',
+    bottom: 8,
+    left: 8,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  durationBadgeText: {
+    color: '#FFF',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  songInfo: {
+    padding: 10,
+  },
+  songName: {
+    color: '#FFF',
+    fontWeight: '600',
+    fontSize: 14,
+    marginBottom: 2,
+  },
+  artistName: {
+    color: '#888',
+    fontSize: 12,
+  },
+  nowPlayingIndicator: {
+    position: 'absolute',
+    bottom: 44,
+    left: 12,
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 2,
+  },
+  nowPlayingBar: {
+    width: 3,
+    backgroundColor: '#1DB954',
+    borderRadius: 2,
+  },
+  emptyStateContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 32,
+    paddingBottom: 80,
+  },
+  emptyStateTitle: {
+    color: '#FFF',
+    fontSize: 22,
+    fontWeight: '700',
+    marginTop: 16,
+    marginBottom: 8,
+  },
+  emptyStateSubtitle: {
+    color: '#888',
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 22,
+  },
+  quickSearchContainer: {
+    marginTop: 24,
+    alignItems: 'center',
+  },
+  quickSearchLabel: {
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 10,
+  },
+  quickSearchTags: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  quickSearchTag: {
+    backgroundColor: '#1a1a2e',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  quickSearchTagText: {
+    color: '#1DB954',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  footerBar: {
+    position: 'absolute',
+    bottom: 70,
+    left: 0,
+    right: 0,
+    backgroundColor: '#0a0a14',
+    borderTopWidth: 1,
+    borderTopColor: '#1a1a2e',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+    zIndex: 5,
+  },
+  footerBarText: {
+    color: '#666',
+    fontSize: 11,
+    marginBottom: 6,
+  },
+  footerLinks: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  socialChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1a1a2e',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    gap: 5,
+  },
+  socialChipText: {
+    color: '#1DB954',
+    fontSize: 11,
+    fontWeight: '500',
+  },
+  bottomNav: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    height: 70,
+    flexDirection: 'row',
+    backgroundColor: '#0d0d14',
+    borderTopWidth: 1,
+    borderTopColor: '#1a1a2e',
+    justifyContent: 'space-around',
+    paddingBottom: Platform.OS === 'ios' ? 16 : 0,
+  },
+  navItem: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  activeNav: {},
+  navLabel: {
+    color: '#888',
+    fontSize: 10,
+    marginTop: 4,
+    fontWeight: '500',
+  },
+  activeNavLabel: {
+    color: '#1DB954',
+    fontWeight: '700',
+  },
+  miniPlayer: {
+    position: 'absolute',
+    bottom: 70,
+    left: 0,
+    right: 0,
+    zIndex: 100,
+    elevation: 10,
+  },
+  miniPlayerGradient: {
+    overflow: 'hidden',
+  },
+  miniProgressBar: {
+    height: 2,
+    backgroundColor: 'rgba(0,0,0,0.3)',
+  },
+  miniProgressFill: {
+    height: 2,
+    backgroundColor: '#FFF',
+  },
+  miniPlayerContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 10,
+  },
+  miniPlayerImage: {
+    width: 44,
+    height: 44,
+    borderRadius: 8,
+  },
+  miniPlayerInfo: {
+    flex: 1,
+    justifyContent: 'center',
+  },
+  miniPlayerSongName: {
+    color: '#FFF',
+    fontWeight: '700',
+    fontSize: 14,
+    marginBottom: 2,
+  },
+  miniPlayerArtist: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 12,
+  },
+  miniPlayerBtn: {
+    padding: 6,
+  },
+  playerContent: {
+    paddingHorizontal: 20,
+    paddingBottom: 100,
+  },
+  playerTopBar: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingTop: Platform.OS === 'android' ? 40 : 50,
+    paddingBottom: 16,
+  },
+  playerTopTitle: {
+    color: '#FFF',
+    fontSize: 14,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+  },
+  albumArtContainer: {
+    alignItems: 'center',
+    marginBottom: 24,
+    elevation: 10,
+  },
+  albumArt: {
+    width: SCREEN_WIDTH - 48,
+    height: SCREEN_WIDTH - 48,
+    borderRadius: 16,
+  },
+  playerSongInfoContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  playerSongName: {
+    color: '#FFF',
+    fontSize: 24,
+    fontWeight: '800',
+    letterSpacing: -0.5,
+  },
+  playerArtist: {
+    color: '#888',
+    fontSize: 16,
+    marginTop: 4,
+  },
+  autoPlayRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 16,
+    gap: 8,
+  },
+  autoPlayText: {
+    color: '#888',
+    fontSize: 13,
+    flex: 1,
+  },
+  toggleSwitch: {
+    width: 44,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#333',
+    justifyContent: 'center',
+    padding: 2,
+  },
+  toggleSwitchActive: {
+    backgroundColor: '#1DB954',
+  },
+  toggleThumb: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#fff',
+    alignSelf: 'flex-start',
+  },
+  toggleThumbActive: {
+    alignSelf: 'flex-end',
+  },
+  progressContainer: {
+    width: '100%',
+    paddingVertical: 16,
+  },
+  seekTapArea: {
+    width: '100%',
+    height: 40,
+    justifyContent: 'center',
+  },
+  seekTrackBg: {
+    width: '100%',
+    height: 4,
+    backgroundColor: '#333',
+    borderRadius: 2,
+    position: 'absolute',
+    top: '50%',
+    marginTop: -2,
+  },
+  seekTrackFill: {
+    height: 4,
+    backgroundColor: '#1DB954',
+    borderRadius: 2,
+    position: 'absolute',
+    left: 0,
+    top: '50%',
+    marginTop: -2,
+  },
+  seekThumb: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: '#FFF',
+    position: 'absolute',
+    top: '50%',
+    marginLeft: -7,
+    marginTop: -7,
+    elevation: 3,
+  },
+  timeRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 8,
+  },
+  timeText: {
+    color: '#888',
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  controls: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginVertical: 16,
+    gap: 16,
+  },
+  controlBtn: {
+    padding: 8,
+    position: 'relative',
+  },
+  playPauseBtn: {
+    marginHorizontal: 8,
+  },
+  playPauseBtnGradient: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    justifyContent: 'center',
+    alignItems: 'center',
+    elevation: 6,
+  },
+  repeatOneDot: {
+    position: 'absolute',
+    bottom: 4,
+    right: 12,
+    width: 5,
+    height: 5,
+    borderRadius: 3,
+    backgroundColor: '#1DB954',
+  },
+  actionButtonsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginTop: 16,
+    paddingHorizontal: 8,
+  },
+  actionBtn: {
+    alignItems: 'center',
+    gap: 4,
+  },
+  actionBtnText: {
+    color: '#888',
+    fontSize: 11,
+    fontWeight: '500',
+  },
+  likedHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  playAllButton: {
+    marginHorizontal: 16,
+    marginBottom: 16,
+  },
+  playAllGradient: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 24,
+    gap: 8,
+  },
+  playAllText: {
+    color: '#FFF',
+    fontWeight: '700',
+    fontSize: 15,
+  },
+  modalContainer: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.85)',
+    justifyContent: 'flex-end',
+  },
+  modalContent: {
+    backgroundColor: '#161622',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    maxHeight: '90%',
+    paddingBottom: 16,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#2a2a3e',
+  },
+  modalTitle: {
+    color: '#FFF',
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  contextMenuContainer: {
+    backgroundColor: '#161622',
+    borderRadius: 16,
+    width: '82%',
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    elevation: 10,
+  },
+  contextMenuTitle: {
+    color: '#FFF',
+    fontWeight: '700',
+    fontSize: 16,
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  menuOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1a1a2e',
+    borderRadius: 8,
+  },
+  menuOptionText: {
+    color: '#FFF',
+    fontSize: 15,
+    marginLeft: 14,
+    flex: 1,
+  },
+  cancelButton: {
+    borderBottomWidth: 0,
+    justifyContent: 'center',
+    backgroundColor: '#2a2a3e',
+    borderRadius: 10,
+    marginTop: 10,
+    paddingVertical: 14,
+  },
+  cancelButtonText: {
+    color: '#FFF',
+    fontSize: 15,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  playlistCreateContainer: {
+    flexDirection: 'row',
+    marginHorizontal: 16,
+    marginBottom: 16,
+    gap: 10,
+  },
+  playlistInput: {
+    flex: 1,
+    height: 48,
+    backgroundColor: '#1a1a2e',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    color: '#FFF',
+    fontSize: 15,
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  createPlaylistButton: {
+    width: 48,
+    height: 48,
+    backgroundColor: '#1DB954',
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  createPlaylistButtonText: {
+    color: '#FFF',
+    fontWeight: '600',
+  },
+  playlistCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#161622',
+    marginHorizontal: 16,
+    marginBottom: 10,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    elevation: 2,
+  },
+  playlistIconBg: {
+    width: 48,
+    height: 48,
+    borderRadius: 12,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  playlistInfo: {
+    flex: 1,
+    marginHorizontal: 14,
+  },
+  playlistName: {
+    color: '#FFF',
+    fontWeight: '600',
+    fontSize: 16,
+    marginBottom: 2,
+  },
+  playlistSongCount: {
+    color: '#888',
+    fontSize: 12,
+  },
+  playlistsListContent: {
+    paddingTop: 4,
+    paddingBottom: 80,
+  },
+  playlistDetailHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    marginBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1a1a2e',
+  },
+  backBtn: {
+    padding: 4,
+  },
+  deleteBtn: {
+    padding: 4,
+  },
+  playlistDetailTitle: {
+    color: '#FFF',
+    fontSize: 18,
+    fontWeight: '700',
+    flex: 1,
+    textAlign: 'center',
+  },
+  playlistNameEdit: {
+    flex: 1,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  playlistNameInput: {
+    flex: 1,
+    height: 40,
+    backgroundColor: '#1a1a2e',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
+    borderWidth: 2,
+    borderColor: '#1DB954',
+  },
+  playlistSongItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginHorizontal: 16,
+    marginBottom: 8,
+    backgroundColor: '#161622',
+    borderRadius: 12,
+  },
+  songIndex: {
+    color: '#666',
+    fontWeight: '600',
+    marginRight: 12,
+    minWidth: 20,
+    fontSize: 13,
+  },
+  playlistSongImage: {
+    width: 48,
+    height: 48,
+    borderRadius: 8,
+    marginRight: 12,
+  },
+  playlistSongDetails: {
+    flex: 1,
+  },
+  playlistSongName: {
+    color: '#FFF',
+    fontWeight: '600',
+    fontSize: 14,
+    marginBottom: 2,
+  },
+  playlistSongArtist: {
+    color: '#888',
+    fontSize: 12,
+  },
+  playlistRemoveButton: {
+    paddingLeft: 12,
+  },
+  playlistSelectItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1a1a2e',
+    gap: 12,
+  },
+  playlistSelectName: {
+    color: '#FFF',
+    fontSize: 15,
+    fontWeight: '600',
+    flex: 1,
+  },
+  playlistSelectCount: {
+    color: '#888',
+    fontSize: 13,
+  },
+  lyricsContent: {
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+  },
+  lyricsSongName: {
+    color: '#FFF',
+    fontSize: 20,
+    fontWeight: '700',
+    marginBottom: 4,
+  },
+  lyricsArtist: {
+    color: '#888',
+    fontSize: 14,
+    marginBottom: 16,
+  },
+  lyricsText: {
+    color: '#CCC',
+    fontSize: 15,
+    lineHeight: 26,
+  },
+  lyricsLineText: {
+    color: '#666',
+    fontSize: 15,
+    lineHeight: 26,
+    marginVertical: 6,
+    paddingHorizontal: 16,
+  },
+  lyricsCurrentLine: {
+    color: '#1DB954',
+    fontSize: 17,
+    fontWeight: '700',
+    backgroundColor: 'rgba(29, 185, 84, 0.1)',
+    paddingVertical: 8,
+    borderLeftWidth: 3,
+    borderLeftColor: '#1DB954',
+    paddingLeft: 13,
+    borderRadius: 4,
+  },
+  queueItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#1a1a2e',
+  },
+  currentQueueItem: {
+    backgroundColor: 'rgba(29, 185, 84, 0.08)',
+  },
+  queueIndex: {
+    color: '#666',
+    fontWeight: '600',
+    marginRight: 12,
+    minWidth: 20,
+  },
+  queueSongInfo: {
+    flex: 1,
+  },
+  queueSongName: {
+    color: '#FFF',
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  queueArtist: {
+    color: '#888',
+    fontSize: 12,
+  },
+  queueControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingLeft: 12,
+  },
+  queueControlBtn: {
+    padding: 6,
+    borderRadius: 6,
+    backgroundColor: 'rgba(29, 185, 84, 0.08)',
+  },
+  queueControlBtnDisabled: {
+    opacity: 0.3,
+  },
+  noSongText: {
+    color: '#888',
+    fontSize: 16,
+    textAlign: 'center',
+    marginTop: 40,
+  },
+  emptyText: {
+    color: '#888',
+    fontSize: 16,
+    textAlign: 'center',
+    marginTop: 40,
+  },
+  loader: {
+    marginTop: 20,
+  },
+  progressBar: {
+    height: 4,
+    backgroundColor: '#1DB954',
+    borderRadius: 2,
+    marginBottom: 8,
+    width: '50%',
+  },
+  progressText: {
+    color: '#888',
+    fontSize: 12,
+  },
+  topButtonsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 16,
+    gap: 12,
+  },
+  smallButton: {
+    flex: 1,
+    backgroundColor: '#161622',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#1DB954',
+    gap: 6,
+  },
+  smallButtonText: {
+    color: '#FFF',
+    fontWeight: '600',
+    fontSize: 14,
+  },
+  likeButtonLarge: {
+    backgroundColor: '#1DB954',
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 12,
+    gap: 8,
+  },
+  likeButtonText: {
+    color: '#FFF',
+    fontWeight: '600',
+    fontSize: 16,
+  },
+  addPlaylistButton: {
+    backgroundColor: '#161622',
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#1DB954',
+    gap: 8,
+  },
+  addPlaylistButtonText: {
+    color: '#FFF',
+    fontWeight: '600',
+    fontSize: 16,
+  },
+  footer: { display: 'none' },
+  footerTitle: { display: 'none' },
+  footerName: { display: 'none' },
+  footerDescription: { display: 'none' },
+  socialLinks: { display: 'none' },
+  socialLink: { display: 'none' },
+  footerVersion: { display: 'none' },
+  footerLine1: { display: 'none' },
+  footerLine2: { display: 'none' },
+  footerConnectText: { display: 'none' },
+  socialIconButton: { display: 'none' },
+  footerLink: { display: 'none' },
+  // ===== LIBRARY TAB BAR =====
+  libraryTabBar: {
+    flexDirection: 'row',
+    marginHorizontal: 16,
+    marginBottom: 12,
+    gap: 10,
+  },
+  libraryTabBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 10,
+    borderRadius: 20,
+    backgroundColor: '#1a1a2e',
+    gap: 6,
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  libraryTabBtnActive: {
+    backgroundColor: '#1DB954',
+    borderColor: '#1DB954',
+  },
+  libraryTabText: {
+    color: '#888',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  libraryTabTextActive: {
+    color: '#FFF',
+  },
+  libraryBadge: {
+    backgroundColor: '#FF4D6D',
+    borderRadius: 10,
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    minWidth: 20,
+    alignItems: 'center',
+  },
+  libraryBadgeText: {
+    color: '#FFF',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  // ===== DOWNLOAD ITEMS =====
+  downloadItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginHorizontal: 16,
+    marginBottom: 8,
+    backgroundColor: '#161622',
+    borderRadius: 12,
+  },
+  downloadItemImage: {
+    width: 48,
+    height: 48,
+    borderRadius: 8,
+    marginRight: 12,
+  },
+  downloadItemName: {
+    color: '#FFF',
+    fontWeight: '600',
+    fontSize: 14,
+    marginBottom: 2,
+  },
+  downloadItemArtist: {
+    color: '#888',
+    fontSize: 12,
+    marginBottom: 1,
+  },
+  downloadItemMeta: {
+    color: '#555',
+    fontSize: 10,
+  },
+  downloadDeleteBtn: {
+    paddingLeft: 12,
+    padding: 6,
+  },
+  // ===== DOWNLOAD BANNER =====
+  downloadBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(29, 185, 84, 0.1)',
+    marginHorizontal: 16,
+    marginBottom: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    gap: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(29, 185, 84, 0.2)',
+  },
+  downloadBannerText: {
+    color: '#1DB954',
+    fontSize: 13,
+    fontWeight: '500',
+    flex: 1,
+  },
+  // ===== SLEEP TIMER =====
+  sleepTimerBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(123, 47, 190, 0.1)',
+    marginHorizontal: 16,
+    marginBottom: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    gap: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(123, 47, 190, 0.2)',
+  },
+  sleepTimerBannerText: {
+    color: '#7B2FBE',
+    fontSize: 13,
+    fontWeight: '500',
+    flex: 1,
+  },
+  // ===== PLAYBACK SPEED =====
+  speedGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: 10,
+    marginBottom: 8,
+  },
+  speedBtn: {
+    width: 70,
+    height: 44,
+    borderRadius: 12,
+    backgroundColor: '#1a1a2e',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#2a2a3e',
+  },
+  speedBtnActive: {
+    backgroundColor: 'rgba(255, 107, 53, 0.15)',
+    borderColor: '#FF6B35',
+  },
+  speedBtnText: {
+    color: '#888',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  speedBtnTextActive: {
+    color: '#FF6B35',
+  },
+  // ===== PLAY COUNT =====
+  playCountBadge: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+    gap: 3,
+  },
+  playCountBadgeText: {
+    color: '#FFF',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  // ===== DOWNLOAD CHIPS (Home) =====
+  downloadChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#161622',
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginRight: 10,
+    width: 200,
+    gap: 8,
+    borderWidth: 1,
+    borderColor: '#1a1a2e',
+  },
+  downloadChipImage: {
+    width: 36,
+    height: 36,
+    borderRadius: 6,
+  },
+  downloadChipName: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  downloadChipArtist: {
+    color: '#888',
+    fontSize: 10,
+  },
+});

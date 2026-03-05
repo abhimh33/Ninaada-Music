@@ -1,0 +1,27 @@
+{
+  "name": "ninaada-music",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "postinstall": "npx patch-package"
+  },
+  "dependencies": {
+    "@expo/vector-icons": "^15.0.3",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "@react-native-voice/voice": "^3.2.4",
+    "axios": "^1.6.0",
+    "expo": "~54.0.33",
+    "expo-av": "~16.0.8",
+    "expo-file-system": "~19.0.21",
+    "expo-linear-gradient": "~15.0.8",
+    "expo-linking": "~8.0.11",
+    "expo-notifications": "~0.32.16",
+    "expo-speech": "~14.0.8",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-track-player": "^4.1.2"
+  }
+}
