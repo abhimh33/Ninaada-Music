@@ -1,7 +1,5 @@
 # 🏗️ Ninaada Music — System Architecture
 
-> Think of this as explaining the app to a friend over coffee ☕
-
 ---
 
 ## 🎯 The Big Picture

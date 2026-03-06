@@ -4,6 +4,8 @@
 
 A premium, high-performance Indian music streaming application available across multiple platforms — Flutter (Android), React Native (Android), and Next.js (Web).
 
+> **Note:** This repository contains only the client-side applications (Flutter, React Native, Web). The backend API that powers these apps is maintained in a separate private repository.
+
 ## 📱 Platforms
 
 | Platform | Directory | Tech Stack |
